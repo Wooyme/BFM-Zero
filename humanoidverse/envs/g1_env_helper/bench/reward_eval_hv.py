@@ -56,7 +56,10 @@ class RewardEvaluationHV:
         return task_to_rewards
 
 from humanoidverse.agents.wrappers.humenvbench import BaseHumEnvBenchWrapper, get_next
-from humanoidverse.envs.g1_env_helper.bench.motion_metrics import METRICS, MotionDatabase, Range, compute_metrics, range_mask
+from humanoidverse.envs.g1_env_helper.bench.motion_metrics import MotionDatabase, run_query
+from humanoidverse.envs.g1_env_helper.queries import METRICS, QueryFunction, load_query, make_query
+from pathlib import Path
+from collections.abc import Mapping
 from torch.utils._pytree import tree_map
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import functools
@@ -131,41 +134,44 @@ class RewardWrapperHV(BaseHumEnvBenchWrapper):
         ctxs = inference_fn(**td).reshape(1, -1)
         return ctxs
 
-    def reward_rank(
+    def query_motions(
         self,
-        ranges: Dict[str, Range],
+        query: QueryFunction | Mapping | str | Path,
         metrics: Sequence[str] | None = None,
         num_samples: int | None = None,
         keep_frames: bool = True,
     ) -> MotionDatabase:
-        """Frames whose metrics all lie in the given ranges, tagged with their metric values.
+        """Frames matching query, tagged with their metric values.
 
-        ranges: metric name -> (lo, hi), inclusive, None for an open bound, e.g.
-            {"base_speed": (0.5, 1.0), "base_height": (0.6, 0.8), "torso_pitch": (-10, 10)}
-        metrics: metrics to record on each frame (default: all of METRICS); the ranged ones are always included.
+        query: a QueryFunction, a config dict for queries.make_query, or the path of a YAML file
+            holding one, e.g. {"type": "LocomotionQuery", "min_speed": 0.5, "max_speed": 1.0}.
+        metrics: metrics to record on each frame (default: all of METRICS).
         num_samples: frames drawn from the buffer (default: num_samples_per_inference).
         keep_frames: also keep qpos / qvel / action / next_obs (or B) of the matching frames.
 
         Sort and search the result with MotionDatabase.sort / top_k / filter / where / nearest.
         """
+        if isinstance(query, (str, Path)):
+            query = load_query(query)
+        elif isinstance(query, Mapping):
+            query = make_query(query)
         names = list(metrics) if metrics is not None else list(METRICS)
-        names += [n for n in ranges if n not in names]
         data = self._sample_inference_data(num_samples)
         qpos = get_next("qpos", data)
         qvel = get_next("qvel", data)
         if isinstance(qpos, torch.Tensor):
             qpos = qpos.cpu().detach().numpy()
             qvel = qvel.cpu().detach().numpy()
-        values = compute_metrics(
+        idx, values = run_query(
             self.env_model,
             qpos,
             qvel,
+            query,
             names,
             max_workers=self.max_workers,
             process_executor=self.process_executor,
             process_context=self.process_context,
         )
-        idx = np.flatnonzero(range_mask(values, ranges))
         frames = {}
         if keep_frames:
             frames = {"qpos": qpos[idx], "qvel": qvel[idx], "action": tree_map(lambda x: x[idx], data["action"])}
@@ -173,12 +179,7 @@ class RewardWrapperHV(BaseHumEnvBenchWrapper):
                 frames["B"] = data["B"][idx]
             else:
                 frames["next_obs"] = tree_map(lambda x: x[idx], get_next("observation", data))
-        return MotionDatabase(
-            metrics={k: v[idx] for k, v in values.items()},
-            source_index=idx,
-            frames=frames,
-            ranges=dict(ranges),
-        )
+        return MotionDatabase(metrics=values, source_index=idx, frames=frames, query=query)
 
     def __deepcopy__(self, memo):
         # Create a new instance of the same type as self

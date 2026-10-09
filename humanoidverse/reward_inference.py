@@ -56,23 +56,7 @@ def make_reward_agent(model, model_folder: Path, num_samples: int) -> RewardWrap
     )
 
 
-def rank(model, model_folder: Path, num_samples: int, rank_ranges: str, rank_sort_by: str | None, rank_top_k: int):
-    """rank_ranges is JSON, e.g. '{"base_speed": [0.5, 1.0], "base_height": [0.6, 0.8], "torso_pitch": [-10, null]}'."""
-    ranges = {k: tuple(v) for k, v in json.loads(rank_ranges).items()}
-    reward_eval_agent = make_reward_agent(model, model_folder, num_samples)
-    start_t = time.time()
-    db = reward_eval_agent.reward_rank(ranges)
-    print(f"{len(db)} frames match {ranges} (done in {time.time()-start_t}s)")
-    path = model_folder / "reward_inference"
-    path.mkdir(exist_ok=True)
-    db.save(path / "reward_rank.pkl")
-    print(f"Saved MotionDatabase at {path}/reward_rank.pkl")
-    if rank_sort_by is not None:
-        db = db.sort(rank_sort_by, descending=True)
-    rich.print(db.to_dataframe().head(rank_top_k).to_string())
-
-
-def main(model_folder: Path, data_path: Path | None = None, headless: bool = True, device="cuda", simulator: str = "isaacsim", save_mp4: bool=False, episode_length: int=500, video_folder: str | None = None, disable_dr: bool = False, disable_obs_noise: bool = False, num_samples: int = 150_000, n_inferences: int = 1, skip_rollouts: bool = False, rank_ranges: str | None = None, rank_sort_by: str | None = None, rank_top_k: int = 20):
+def main(model_folder: Path, data_path: Path | None = None, headless: bool = True, device="cuda", simulator: str = "isaacsim", save_mp4: bool=False, episode_length: int=500, video_folder: str | None = None, disable_dr: bool = False, disable_obs_noise: bool = False, num_samples: int = 150_000, n_inferences: int = 1, skip_rollouts: bool = False):
     model_folder = Path(model_folder)
     video_folder = Path(video_folder) if video_folder is not None else model_folder / "reward_inference" / "videos"
     video_folder.mkdir(parents=True, exist_ok=True)
@@ -81,9 +65,6 @@ def main(model_folder: Path, data_path: Path | None = None, headless: bool = Tru
     model.to(device)
     model.eval()
     model_name = model.__class__.__name__
-    if rank_ranges is not None:
-        # rank mode: only needs the model and the replay buffer, no simulator
-        return rank(model, model_folder, num_samples, rank_ranges, rank_sort_by, rank_top_k)
     with open(model_folder / "config.json", "r") as f:
         config = json.load(f)
 

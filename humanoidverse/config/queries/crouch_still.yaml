@@ -1,0 +1,6 @@
+# Low, nearly stationary, torso not pitched far forward. Keys are min_<metric> / max_<metric>
+# for any metric in envs/g1_env_helper/queries/metrics.py.
+type: RangeQuery
+max_base_height: 0.5
+max_base_speed: 0.1
+max_torso_pitch: 30

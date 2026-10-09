@@ -293,6 +293,41 @@ uv run python -m humanoidverse.reward_inference \
 
 ---
 
+### Motion query
+
+Selects replay-buffer frames with a `QueryFunction` and tags them with motion metrics (`METRICS` in `humanoidverse/envs/g1_env_helper/queries/metrics.py`). Needs only the model and the buffer, no simulator.
+
+```bash
+uv run python -m humanoidverse.motion_query \
+    --model_folder /path/to/model \
+    --query humanoidverse/config/queries/walk_forward.yaml \
+    --sort_by base_speed
+```
+
+A query is a YAML file: `type` is the query class name, the other keys are its fields. Bounds are named `min_<x>` / `max_<x>` (inclusive, `null` or omitted for no bound):
+
+```yaml
+type: LocomotionQuery    # speed, egocentric direction (wraps around +-180) and pelvis height
+min_speed: 0.5
+max_speed: 1.0
+min_angle: -30
+max_angle: 30
+```
+
+```yaml
+type: RangeQuery         # min_<metric> / max_<metric> for any metric in METRICS
+max_base_height: 0.5
+max_base_speed: 0.1
+```
+
+To add a query, put a dataclass subclassing `QueryFunction` with `match(model, data) -> bool` in a new module under `humanoidverse/envs/g1_env_helper/queries/`; it is discovered by class name, no registration needed.
+
+**Outputs** (under `model_folder/motion_query/`):
+
+- `motion_db.pkl`: `MotionDatabase` of the matching frames, loadable with `MotionDatabase.load` and searchable with `sort` / `top_k` / `filter(min_<metric>=..., max_<metric>=...)` / `where` / `nearest`.
+
+---
+
 
 
 ## License

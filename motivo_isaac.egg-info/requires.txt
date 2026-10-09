@@ -19,6 +19,7 @@ pot>=0.9.5
 pydantic>=2.11.3
 rich>=14.0.0
 safetensors>=0.5.3
+scipy>=1.11
 tensordict>=0.8.3
 termcolor>=3.0.1
 torch==2.7.1

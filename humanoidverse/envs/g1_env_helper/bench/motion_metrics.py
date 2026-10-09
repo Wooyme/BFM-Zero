@@ -1,8 +1,7 @@
-"""Per-frame motion metrics and a searchable subset database used by RewardWrapperHV.reward_rank.
+"""Run a QueryFunction over buffer frames and keep the matches in a searchable MotionDatabase.
 
-Each metric reads one quantity from a forwarded mujoco.MjData. To add a metric, register a
-function in METRICS; reward_rank and MotionDatabase pick it up by name with no other changes.
-Angles are in degrees, lengths in m, velocities in m/s (deg/s for angular rates).
+Used by RewardWrapperHV.query_motions. Queries live in g1_env_helper/queries; metrics that tag
+each matching frame (for sorting / filtering afterwards) are METRICS in queries/metrics.py.
 """
 
 import dataclasses
@@ -16,86 +15,43 @@ import joblib
 import mujoco
 import numpy as np
 
-from humanoidverse.envs.g1_env_helper.rewards import get_center_of_mass_linvel, get_xmat, get_xpos, rot2eul
+from humanoidverse.envs.g1_env_helper.queries import METRICS, QueryFunction, parse_bounds
 
-MetricFn = Callable[[mujoco.MjModel, mujoco.MjData], float]
 Range = Tuple[float | None, float | None]
 
 
-def _heading_velocity(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
-    """Pelvis linear velocity in the yaw-only (heading) frame: [forward, left, up]."""
-    # free joint: qvel[0:3] is the world-frame linear velocity
-    yaw = rot2eul(get_xmat(model, data, "pelvis"))[2]
-    c, s = np.cos(yaw), np.sin(yaw)
-    vx, vy, vz = data.qvel[0:3]
-    return np.array([c * vx + s * vy, -s * vx + c * vy, vz])
-
-
-def _world_angvel(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
-    # free joint: qvel[3:6] is the angular velocity in the body frame
-    return get_xmat(model, data, "pelvis") @ data.qvel[3:6]
-
-
-def _euler_deg(model: mujoco.MjModel, data: mujoco.MjData, body: str, axis: int) -> float:
-    return float(np.rad2deg(rot2eul(get_xmat(model, data, body))[axis]))
-
-
-METRICS: Dict[str, MetricFn] = {
-    # base (pelvis) position / velocity
-    "base_height": lambda m, d: float(get_xpos(m, d, "pelvis")[2]),
-    "base_speed": lambda m, d: float(np.linalg.norm(d.qvel[0:2])),
-    "base_vx": lambda m, d: float(_heading_velocity(m, d)[0]),
-    "base_vy": lambda m, d: float(_heading_velocity(m, d)[1]),
-    "base_vz": lambda m, d: float(d.qvel[2]),
-    # direction of horizontal motion relative to heading, same convention as move-ego-<angle>-<speed>
-    "move_angle": lambda m, d: float(np.rad2deg(np.arctan2(*_heading_velocity(m, d)[[1, 0]]))),
-    # same quantity LocomotionReward scores on
-    "com_speed": lambda m, d: float(np.linalg.norm(get_center_of_mass_linvel(m, d)[0:2])),
-    "yaw_rate": lambda m, d: float(np.rad2deg(_world_angvel(m, d)[2])),
-    # orientation
-    "base_roll": lambda m, d: _euler_deg(m, d, "pelvis", 0),
-    "base_pitch": lambda m, d: _euler_deg(m, d, "pelvis", 1),
-    "torso_roll": lambda m, d: _euler_deg(m, d, "torso_link", 0),
-    "torso_pitch": lambda m, d: _euler_deg(m, d, "torso_link", 1),
-    # body part heights
-    "torso_height": lambda m, d: float(get_xpos(m, d, "torso_link")[2]),
-    "left_hand_height": lambda m, d: float(get_xpos(m, d, "left_rubber_hand")[2]),
-    "right_hand_height": lambda m, d: float(get_xpos(m, d, "right_rubber_hand")[2]),
-    "left_knee_height": lambda m, d: float(get_xpos(m, d, "left_knee_link")[2]),
-    "right_knee_height": lambda m, d: float(get_xpos(m, d, "right_knee_link")[2]),
-    "left_foot_height": lambda m, d: float(get_xpos(m, d, "left_ankle_roll_link")[2]),
-    "right_foot_height": lambda m, d: float(get_xpos(m, d, "right_ankle_roll_link")[2]),
-}
-
-
-def _metrics_worker(x, model: mujoco.MjModel, names: Sequence[str]) -> np.ndarray:
-    qpos, qvel = x
+def _query_worker(x, model: mujoco.MjModel, query: QueryFunction, names: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
+    offset, qpos, qvel = x
     fns = [METRICS[n] for n in names]
     data = mujoco.MjData(model)
-    out = np.zeros((qpos.shape[0], len(names)), dtype=np.float32)
+    idx, out = [], []
     for i in range(qpos.shape[0]):
         data.qpos[:] = qpos[i]
         data.qvel[:] = qvel[i]
         mujoco.mj_forward(model, data)
-        out[i] = [fn(model, data) for fn in fns]
-    return out
+        if query.match(model, data):
+            idx.append(offset + i)
+            out.append([fn(model, data) for fn in fns])
+    return np.array(idx, dtype=np.int64), np.array(out, dtype=np.float32).reshape(len(idx), len(names))
 
 
-def compute_metrics(
+def run_query(
     model: mujoco.MjModel,
     qpos: np.ndarray,
     qvel: np.ndarray,
+    query: QueryFunction,
     names: Sequence[str],
     max_workers: int = 5,
     process_executor: bool = False,
     process_context: str = "spawn",
-) -> Dict[str, np.ndarray]:
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Indices of the frames matching query, and the metrics in names for those frames."""
     unknown = [n for n in names if n not in METRICS]
     if unknown:
         raise ValueError(f"Unknown metrics {unknown}, available: {list(METRICS)}")
     chunk_size = int(np.ceil(qpos.shape[0] / max_workers))
-    args = [(qpos[i : i + chunk_size], qvel[i : i + chunk_size]) for i in range(0, qpos.shape[0], chunk_size)]
-    f = functools.partial(_metrics_worker, model=model, names=list(names))
+    args = [(i, qpos[i : i + chunk_size], qvel[i : i + chunk_size]) for i in range(0, qpos.shape[0], chunk_size)]
+    f = functools.partial(_query_worker, model=model, query=query, names=list(names))
     if max_workers == 1:
         result = [f(a) for a in args]
     elif process_executor:
@@ -104,8 +60,9 @@ def compute_metrics(
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as exe:
             result = list(exe.map(f, args))
-    values = np.concatenate(result)
-    return {n: values[:, j] for j, n in enumerate(names)}
+    idx = np.concatenate([r[0] for r in result])
+    values = np.concatenate([r[1] for r in result])
+    return idx, {n: values[:, j] for j, n in enumerate(names)}
 
 
 def range_mask(metrics: Mapping[str, np.ndarray], ranges: Mapping[str, Range]) -> np.ndarray:
@@ -133,15 +90,15 @@ class MotionDatabase:
     """A set of frames with their metric tags. All operations return a new MotionDatabase.
 
     metrics: name -> (N,) values
-    source_index: (N,) index of each frame in the data reward_rank sampled from the buffer
+    source_index: (N,) index of each frame in the data query_motions sampled from the buffer
     frames: per-frame data kept for later use (qpos, qvel, action, next_obs / B, ...)
-    ranges: the range query that produced this subset
+    query: the QueryFunction that produced this subset
     """
 
     metrics: Dict[str, np.ndarray]
     source_index: np.ndarray
     frames: Dict[str, Any] = dataclasses.field(default_factory=dict)
-    ranges: Dict[str, Range] = dataclasses.field(default_factory=dict)
+    query: QueryFunction | None = None
 
     def __len__(self) -> int:
         return len(self.source_index)
@@ -157,7 +114,7 @@ class MotionDatabase:
             metrics={k: v[idx] for k, v in self.metrics.items()},
             source_index=self.source_index[idx],
             frames=_take(self.frames, idx),
-            ranges=dict(self.ranges),
+            query=self.query,
         )
 
     def __getitem__(self, i: int) -> Dict[str, Any]:
@@ -167,12 +124,9 @@ class MotionDatabase:
         rec.update(_take(self.frames, i))
         return rec
 
-    def filter(self, ranges: Mapping[str, Range] | None = None, **kw: Range) -> "MotionDatabase":
-        """Narrow further, e.g. db.filter(base_pitch=(-5, 5))."""
-        ranges = {**(ranges or {}), **kw}
-        db = self.select(np.flatnonzero(range_mask(self.metrics, ranges)))
-        db.ranges.update(ranges)
-        return db
+    def filter(self, **bounds: float | None) -> "MotionDatabase":
+        """Narrow further with min_<metric> / max_<metric>, e.g. db.filter(min_base_pitch=-5, max_base_pitch=5)."""
+        return self.select(np.flatnonzero(range_mask(self.metrics, parse_bounds(bounds, self.metrics))))
 
     def where(self, fn: Callable[[Dict[str, np.ndarray]], np.ndarray]) -> "MotionDatabase":
         """Arbitrary boolean predicate, e.g. db.where(lambda m: m["left_hand_height"] > m["right_hand_height"])."""

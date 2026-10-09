@@ -28,6 +28,7 @@ Requires-Dist: pot>=0.9.5
 Requires-Dist: pydantic>=2.11.3
 Requires-Dist: rich>=14.0.0
 Requires-Dist: safetensors>=0.5.3
+Requires-Dist: scipy>=1.11
 Requires-Dist: tensordict>=0.8.3
 Requires-Dist: termcolor>=3.0.1
 Requires-Dist: torch==2.7.1
@@ -113,6 +114,72 @@ uv sync
 - **Motion data**: Included via Git LFS in `humanoidverse/data/` after `git lfs pull`. `lafan_29dof.pkl` is for evaluation; `lafan_29dof_10s-clipped.pkl` is for training.
 - If you are unsure about the data format, please check the discussion in
   [Issue #12](https://github.com/LeCAR-Lab/BFM-Zero/issues/12).
+
+### Convert GMR G1 motions
+
+Convert the trusted GMR `.pkl` files in a directory into a separate BFM-Zero dataset:
+
+```bash
+uv run python scripts/convert_gmr_to_bfm.py ../GMR/bvh/gmr_g1 \
+    -o humanoidverse/data/gmr_g1_10s-clipped.pkl
+```
+
+The converter runs on CPU using NumPy, SciPy, Joblib, and MuJoCo; it does not start Isaac Sim or import GMR.
+It maps the 29 joints by name from the source MJCF to the BFM G1 model, resamples to 30 FPS
+(linear position/joint interpolation and quaternion SLERP), and writes non-overlapping 300-frame clips.
+Trailing frames and motions shorter than 300 resampled frames are discarded and reported.
+Each entry is named `<source_stem>_clip<N>` and contains the same seven fields as
+`lafan_29dof_10s-clipped.pkl`, with float32 arrays and integer `fps=30`.
+**`smpl_joints` is an all-zero `[300, 24, 3]` placeholder**, since GMR robot motions do not contain
+the original human SMPL joints; the current BFM-Zero robot motion loader does not use this field.
+
+By default, `--height-mode sequence` shifts each complete resampled motion vertically so its
+lowest robot collision geometry point reaches `--ground-offset` (default: 0 meters).
+This uses the target G1 meshes, spheres, and cylinders over all frames, before splitting clips;
+all clips of one motion share the same offset. XY, joint motion, and relative height changes are preserved.
+Use `--height-mode none` to preserve the original root trajectory. This is format conversion and
+uniform height alignment, not IK, contact correction, or terrain reconstruction.
+GMR and BFM G1 models have some different fixed body offsets, so Cartesian body trajectories may differ.
+
+Defaults for `--source-mjcf` and `--target-mjcf` point to the sibling GMR `g1_mocap_29dof.xml`
+and this repository's `g1_29dof.xml`, respectively; override them if the models live elsewhere.
+The source MJCF must match the model used to export `dof_pos`; the converter expects GMR's XYZW quaternion convention.
+Existing output files require `--overwrite`. Output must be outside the source directory.
+The result is validated and reloaded before publication, and existing LAFAN files are not modified.
+
+For training, set `TrainConfig.env.lafan_tail_path` (the `HumanoidVerseIsaacConfig` field in
+`humanoidverse/train.py`) to `humanoidverse/data/gmr_g1_10s-clipped.pkl`.
+For tracking inference, pass this path as `--data_path`.
+
+### Render motion data on G1
+
+Render a clipped BFM-Zero dataset directly to MP4 without a trained policy or Isaac Sim:
+
+```bash
+# Show motion names and zero-based indices.
+uv run python scripts/render_bfm_motion.py humanoidverse/data/gmr_g1_10s-clipped.pkl --list
+
+# Export one clip (defaults to index 0 if no selector is provided).
+uv run python scripts/render_bfm_motion.py humanoidverse/data/gmr_g1_10s-clipped.pkl \
+    --motion FDCGB_0_clip0 -o videos/FDCGB_0_clip0.mp4
+
+# Export every clip as a separate video.
+uv run python scripts/render_bfm_motion.py humanoidverse/data/gmr_g1_10s-clipped.pkl \
+    --all --output-dir videos/gmr_g1
+```
+
+The script uses the BFM G1 model and ground plane, preserves the stored root trajectory and joint angles,
+and converts XYZW quaternions to MuJoCo's WXYZ convention. **This is kinematic reference playback,
+not a policy rollout or a test of physical feasibility.** Both LAFAN and converted GMR libraries are supported;
+`smpl_joints` is not used. Video FPS comes from the motion, so 300 frames at 30 FPS produces a 10-second video.
+
+Default resolution is 1280×720, with a camera following the pelvis. Options include `--index 0`,
+`--camera fixed`, `--distance 3`, `--azimuth 135`, `--elevation -20`, `--width 640 --height 360`,
+and `--max-frames 30` for a short preview. Without an output argument, videos go to
+`videos/<input_stem>/<motion_name>.mp4`. Existing videos require `--overwrite`.
+Rendering uses MuJoCo, MediaPy, and FFmpeg. The default OpenGL backend is `egl` for headless GPU rendering
+(or the existing `MUJOCO_GL` environment variable); `--backend osmesa` supports software rendering when
+OSMesa is installed, and `--backend glfw` uses a display. `--list` does not initialize OpenGL.
 
 
 ## Training
@@ -265,6 +332,23 @@ uv run python -m humanoidverse.reward_inference \
 
 ---
 
+### Motion query
+
+Selects replay-buffer frames whose motion metrics (see `METRICS` in `humanoidverse/envs/g1_env_helper/bench/motion_metrics.py`) lie in the given ranges. Needs only the model and the buffer, no simulator.
+
+```bash
+uv run python -m humanoidverse.motion_query \
+    --model_folder /path/to/model \
+    --ranges '{"base_speed": [0.5, 1.0], "base_height": [0.6, 0.8], "torso_pitch": [-10, null]}' \
+    --sort_by base_speed
+```
+
+**Outputs** (under `model_folder/motion_query/`):
+
+- `motion_db.pkl`: `MotionDatabase` of the matching frames, loadable with `MotionDatabase.load` and searchable with `sort` / `top_k` / `filter` / `where` / `nearest`.
+
+---
+
 
 
 ## License
@@ -302,4 +386,3 @@ Wrong arXiv id here!!
 ## Contact
 
 If you have any problems, please contact [liyitang475@gmail.com](mailto:liyitang475@gmail.com).
-
