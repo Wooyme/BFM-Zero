@@ -1,0 +1,25 @@
+{
+    "capacity": 5000,
+    "device": "cuda",
+    "nested_key_separator": "-",
+    "n_dim": 2,
+    "seq_length": 1,
+    "output_key_t": [
+        "observation",
+        "action",
+        "z",
+        "terminated",
+        "truncated",
+        "step_count",
+        "reward",
+        "aux_rewards"
+    ],
+    "output_key_tp1": [
+        "observation",
+        "terminated"
+    ],
+    "end_key": "truncated",
+    "_idx": 2500,
+    "_is_full": true,
+    "__target__": "metamotivo.buffers.trajectory.TrajectoryDictBufferMultiDim"
+}
