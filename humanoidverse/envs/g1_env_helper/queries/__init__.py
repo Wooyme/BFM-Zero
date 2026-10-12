@@ -23,12 +23,14 @@ from .base import QueryFunction, in_bounds, parse_bounds
 from .locomotion import LocomotionQuery
 from .metrics import METRICS
 from .range import RangeQuery
+from .walk import WalkQuery
 
 __all__ = [
     "METRICS",
     "QueryFunction",
     "LocomotionQuery",
     "RangeQuery",
+    "WalkQuery",
     "in_bounds",
     "parse_bounds",
     "get_query_classes",

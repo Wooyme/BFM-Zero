@@ -128,8 +128,12 @@ class MotionDatabase:
         """Narrow further with min_<metric> / max_<metric>, e.g. db.filter(min_base_pitch=-5, max_base_pitch=5)."""
         return self.select(np.flatnonzero(range_mask(self.metrics, parse_bounds(bounds, self.metrics))))
 
-    def where(self, fn: Callable[[Dict[str, np.ndarray]], np.ndarray]) -> "MotionDatabase":
-        """Arbitrary boolean predicate, e.g. db.where(lambda m: m["left_hand_height"] > m["right_hand_height"])."""
+    def where(self, fn: str | Callable[[Dict[str, np.ndarray]], np.ndarray]) -> "MotionDatabase":
+        """Arbitrary boolean predicate, e.g. db.where(lambda m: m["left_hand_height"] > m["right_hand_height"]),
+        or a pandas.DataFrame.query expression over the metrics and source_index,
+        e.g. db.where("base_speed > 0.5 and abs(move_angle) < 30")."""
+        if isinstance(fn, str):
+            return self.select(self.to_dataframe().query(fn).index.to_numpy())
         return self.select(np.flatnonzero(fn(self.metrics)))
 
     def sort(self, by: str | Sequence[str], descending: bool = False) -> "MotionDatabase":

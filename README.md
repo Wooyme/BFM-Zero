@@ -324,7 +324,59 @@ To add a query, put a dataclass subclassing `QueryFunction` with `match(model, d
 
 **Outputs** (under `model_folder/motion_query/`):
 
-- `motion_db.pkl`: `MotionDatabase` of the matching frames, loadable with `MotionDatabase.load` and searchable with `sort` / `top_k` / `filter(min_<metric>=..., max_<metric>=...)` / `where` / `nearest`.
+- `motion_db.pkl`: `MotionDatabase` of the matching frames, loadable with `MotionDatabase.load` and searchable with `sort` / `top_k` / `filter(min_<metric>=..., max_<metric>=...)` / `where` (callable or query string) / `nearest`.
+
+### Motion viewer
+
+Browses a `MotionDatabase` interactively: queries at a prompt, frames shown in the MuJoCo viewer with the selected metrics overlaid. Needs a display.
+
+```bash
+uv run python -m humanoidverse.motion_viewer --db /path/to/model/motion_query/motion_db.pkl
+```
+
+```text
+> where base_speed > 1 and abs(move_angle) < 30    # same pandas expression as motion_latent --where
+> sort base_speed                                   # descending; "sort base_speed asc" for ascending
+> head 10                                           # table from the cursor; "head 10 all" for every metric
+>                                                   # empty line: next frame (also n / p / <index>)
+> play 20                                           # step through the view at 20 fps, then stop
+> back                                              # undo the last query; reset for the whole database
+> save /tmp/walk_fast.pkl                           # current view, usable as motion_latent --db
+```
+
+`help` lists the rest (`filter`, `nearest`, `limit`, `describe`, `info`, `columns`, `center`).
+
+### Motion latent
+
+Turns frames of a `MotionDatabase` (from motion query) into latent z. Frames are selected with a [pandas query](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.query.html) expression over the metric columns and `source_index`: comparisons, `and` / `or` / `not`, arithmetic, `abs`, `a < x < b`, `x in [..]`.
+
+```bash
+uv run python -m humanoidverse.motion_latent \
+    --model_folder /path/to/model \
+    --where "base_speed > 0.5 and abs(move_angle) < 30 and torso_pitch < 15" \
+    --name walk_forward
+```
+
+By default all selected frames give one z (backward embedding averaged over them, i.e. reward inference with reward 1 on the selection); `--per_frame` gives one z per frame (goal inference). `--sort_by <metric> [--ascending] --limit N` keeps the first N frames after sorting. `--db` defaults to `model_folder/motion_query/motion_db.pkl`.
+
+**Outputs:** `model_folder/motion_latent/latent_z.pkl` (or `--output`): `{name: z}` with z of shape `(1, z_dim)` or `(N, z_dim)`. An existing file is updated, so several selections can be collected under different `--name`s (default: the `--where` expression).
+
+### Motion vocab
+
+Selects the fixed token vocabulary of holosoma `bfm_walk_token` from the replay buffer. Frames passing `WalkQuery` (torso tilt ≤ 30°, a foot within 0.05 m of the ground, pelvis height, inside the command range) are split into walking-command buckets: stand, low speed, 5 translation tiers of `max(|vx|, |vy|)` and 3 turning tiers of `|yaw_rate|`. Each bucket then keeps its quota of frames pairwise apart in a weighted qpos distance (yaw-free base quaternion, base height and joints, weighted more near the pelvis and on the legs): frames are visited in random order and kept when no kept frame is within a threshold, and the threshold is bisected until the quota is filled. Buckets, quotas (`total` split by command group shares) and weights are in `humanoidverse/config/queries/walk_vocab.yaml`. The buffer is streamed from its hdf5, never loaded whole.
+
+```bash
+uv run python -m humanoidverse.motion_vocab --model_folder /path/to/model --latent
+```
+
+`--max_frames N` / `--stride K` scan only part of the buffer for a quick try.
+
+**Outputs** (under `model_folder/motion_vocab/`, or `--output`):
+
+- `motion_db.pkl`: the selected frames, with a `bucket` metric giving the bucket number. Browse it with `motion_viewer` (`where bucket == 3`).
+- `latent_z.pkl` (with `--latent`): `{bucket name: z}`, one z per frame from goal inference. Bucket names sort in token order, so it can be passed directly to holosoma `scripts/build_bfm_vocab.py`.
+
+Velocities follow the walking command: `base_vx` / `base_vy` are in m/s in the heading frame, and `yaw_rate` is in rad/s.
 
 ---
 

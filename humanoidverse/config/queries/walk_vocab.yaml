@@ -1,0 +1,73 @@
+# Token vocabulary for holosoma bfm_walk_token, built with humanoidverse.motion_vocab.
+# Velocities are those of the walking command: base_vx / base_vy in m/s (heading frame),
+# yaw_rate in rad/s, all instantaneous qvel of the frame.
+
+# Every candidate frame: upright torso, pelvis height range, a foot on the ground, inside the
+# command range. Foot clearance: lower ankle_roll_link height minus its 0.035 m with the sole flat.
+query:
+  type: WalkQuery
+  max_torso_tilt: 30
+  max_foot_clearance: 0.05
+  ground_ankle_height: 0.035
+  min_height: 0.55
+  max_height: 1.0
+  max_abs_vx: 1.05
+  max_abs_vy: 1.05
+  max_abs_yaw_rate: 1.05
+
+total: 4000
+# Share of total per group, as WalkingCommand samples them (stand_prob 0.2, exclusive_turn_prob 0.5);
+# split equally among the buckets of the group unless a bucket sets its own quota.
+groups:
+  stand: 0.2
+  translate: 0.4
+  turn: 0.4
+
+# Weighted qpos distance inside a bucket, see bench/motion_similarity.py.
+similarity:
+  base_quat: 4.0
+  base_height: 4.0
+  joints:
+    waist: 3.0
+    hip: 2.5
+    knee: 2.0
+    ankle: 1.0
+    shoulder: 0.8
+    elbow: 0.5
+    wrist: 0.2
+# Optional floor on the distance threshold of a bucket; a bucket then keeps fewer than its quota.
+min_dist: null
+
+# pandas expressions over the metrics; a frame goes to the first bucket it matches.
+# Translation tiers are square rings of max(|vx|, |vy|), since vx and vy are sampled independently.
+buckets:
+  - name: 00_stand
+    group: stand
+    where: abs(base_vx) < 0.05 and abs(base_vy) < 0.05 and abs(yaw_rate) < 0.05
+  - name: 01_low
+    group: translate
+    where: abs(base_vx) <= 0.2 and abs(base_vy) <= 0.2 and abs(yaw_rate) < 0.15
+  - name: 02_move_1
+    group: translate
+    where: (abs(base_vx) > 0.2 or abs(base_vy) > 0.2) and abs(base_vx) <= 0.36 and abs(base_vy) <= 0.36 and abs(yaw_rate) < 0.15
+  - name: 03_move_2
+    group: translate
+    where: (abs(base_vx) > 0.36 or abs(base_vy) > 0.36) and abs(base_vx) <= 0.52 and abs(base_vy) <= 0.52 and abs(yaw_rate) < 0.15
+  - name: 04_move_3
+    group: translate
+    where: (abs(base_vx) > 0.52 or abs(base_vy) > 0.52) and abs(base_vx) <= 0.68 and abs(base_vy) <= 0.68 and abs(yaw_rate) < 0.15
+  - name: 05_move_4
+    group: translate
+    where: (abs(base_vx) > 0.68 or abs(base_vy) > 0.68) and abs(base_vx) <= 0.84 and abs(base_vy) <= 0.84 and abs(yaw_rate) < 0.15
+  - name: 06_move_5
+    group: translate
+    where: (abs(base_vx) > 0.84 or abs(base_vy) > 0.84) and abs(base_vx) <= 1.05 and abs(base_vy) <= 1.05 and abs(yaw_rate) < 0.15
+  - name: 07_turn_1
+    group: turn
+    where: abs(base_vx) < 0.1 and abs(base_vy) < 0.1 and 0.05 <= abs(yaw_rate) < 0.37
+  - name: 08_turn_2
+    group: turn
+    where: abs(base_vx) < 0.1 and abs(base_vy) < 0.1 and 0.37 <= abs(yaw_rate) < 0.68
+  - name: 09_turn_3
+    group: turn
+    where: abs(base_vx) < 0.1 and abs(base_vy) < 0.1 and 0.68 <= abs(yaw_rate) <= 1.05
