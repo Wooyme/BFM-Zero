@@ -110,8 +110,8 @@ class MotionViewer(cmd.Cmd):
             return False
 
     def do_where(self, arg: str) -> None:
-        """where <expr>: keep frames matching a pandas query expression, e.g.
-        where base_speed > 0.5 and abs(move_angle) < 30"""
+        """where <expr>: keep frames matching a SQL condition (DuckDB, as in the query scripts), e.g.
+        where base_speed > 0.5 AND abs(move_angle) < 30"""
         self._push(self.db.where(arg))
 
     def do_filter(self, arg: str) -> None:
@@ -231,7 +231,7 @@ def main(db: Path, where: str | None = None, center: bool = True, mjcf: Path = M
 
     Args:
         db: MotionDatabase pickle written by motion_query.
-        where: initial pandas query expression, same as the where command.
+        where: initial SQL condition, same as the where command.
         center: move the root to the origin in xy, so frames from different clips stay in view.
         mjcf: robot model the qpos refers to (the one motion_query computed metrics with).
     """

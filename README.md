@@ -295,36 +295,40 @@ uv run python -m humanoidverse.reward_inference \
 
 ### Motion query
 
-Selects replay-buffer frames with a `QueryFunction` and tags them with motion metrics (`METRICS` in `humanoidverse/envs/g1_env_helper/queries/metrics.py`). Needs only the model and the buffer, no simulator.
+Each query is a script in `scripts/queries/` that selects frames of the replay buffer (or of LAFAN motions with `--lafan "walk*,run*"`). It does this with one chain of SQL-like operations over per-frame motion metrics (`METRICS` in `humanoidverse/envs/g1_env_helper/queries/metrics.py`). The buffer is streamed from its hdf5; no model and no simulator are needed.
 
 ```bash
-uv run python -m humanoidverse.motion_query \
-    --model_folder /path/to/model \
-    --query humanoidverse/config/queries/walk_forward.yaml \
-    --sort_by base_speed
+uv run python scripts/queries/walk_forward.py --model-folder /path/to/model [--max-frames N] [--stride K]
 ```
 
-A query is a YAML file: `type` is the query class name, the other keys are its fields. Bounds are named `min_<x>` / `max_<x>` (inclusive, `null` or omitted for no bound):
-
-```yaml
-type: LocomotionQuery    # speed, egocentric direction (wraps around +-180) and pelvis height
-min_speed: 0.5
-max_speed: 1.0
-min_angle: -30
-max_angle: 30
+```python
+db = (
+    source.scan()                                         # lazy until collect() / to_database()
+    .where("base_height >= 0.6")
+    .where("base_speed BETWEEN 0.5 AND 1.0 AND move_angle BETWEEN -30 AND 30")
+    .with_columns(cmd_speed="greatest(abs(base_vx), abs(base_vy))")    # SQL expression or Python column function
+    .case("tier", {"slow": "cmd_speed < 0.7"}, default="fast")         # label of the first matching condition
+    .order_by("base_speed DESC")
+    .to_database()
+)
 ```
 
-```yaml
-type: RangeQuery         # min_<metric> / max_<metric> for any metric in METRICS
-max_base_height: 0.5
-max_base_speed: 0.1
+When the SQL gets complex, write it as one raw statement over the table `frames`, inline or from a `.sql` file. Other keyword arguments bind `$name` parameters, and DataFrames bind extra tables. The raw statement can sit anywhere in the chain:
+
+```python
+db = (
+    source.scan()
+    .sql(Path("my_query.sql"), per_chunk=True, lim=1.05)   # per_chunk: row-local, so it runs while scanning
+    .sample(4000).spread()
+    .to_database()
+)
 ```
 
-To add a query, put a dataclass subclassing `QueryFunction` with `match(model, data) -> bool` in a new module under `humanoidverse/envs/g1_env_helper/queries/`; it is discovered by class name, no registration needed.
+Without `per_chunk`, a statement may use `ORDER BY`, `LIMIT`, aggregates, windows or joins, and runs once on all the rows that reach it.
 
-**Outputs** (under `model_folder/motion_query/`):
+Conditions and expressions are DuckDB SQL over the columns `frame` (index in the source), every metric, and `qpos_0 .. qpos_35`. The leading `where` / `case` / SQL `with_columns` steps run while scanning, chunk by chunk. Everything after the first other step (`order_by`, `limit`, `sql`, Python column functions, `sample`) runs on the rows that pass them. `humanoidverse/query/motion_query.py` (`Source`, `Query`) and `humanoidverse/query/motion_sampling.py` are libraries; copy a script to write a new query. To add a metric, register a `Metric` object (a frozen dataclass with `__call__(model, data) -> float`) in `METRICS`.
 
-- `motion_db.pkl`: `MotionDatabase` of the matching frames, loadable with `MotionDatabase.load` and searchable with `sort` / `top_k` / `filter(min_<metric>=..., max_<metric>=...)` / `where` (callable or query string) / `nearest`.
+**Outputs**: the script decides; the simple ones write `model_folder/motion_query/motion_db.pkl` (or `--output`). This is a `MotionDatabase` loadable with `MotionDatabase.load` and searchable with `sort` / `top_k` / `filter(min_<metric>=..., max_<metric>=...)` / `where` (SQL condition or callable) / `nearest`. Text columns (e.g. `bucket`) are stored as codes, with their values in `db.labels`.
 
 ### Motion viewer
 
@@ -335,7 +339,7 @@ uv run python -m humanoidverse.motion_viewer --db /path/to/model/motion_query/mo
 ```
 
 ```text
-> where base_speed > 1 and abs(move_angle) < 30    # same pandas expression as motion_latent --where
+> where base_speed > 1 AND abs(move_angle) < 30    # SQL condition, same as motion_latent --where
 > sort base_speed                                   # descending; "sort base_speed asc" for ascending
 > head 10                                           # table from the cursor; "head 10 all" for every metric
 >                                                   # empty line: next frame (also n / p / <index>)
@@ -348,12 +352,12 @@ uv run python -m humanoidverse.motion_viewer --db /path/to/model/motion_query/mo
 
 ### Motion latent
 
-Turns frames of a `MotionDatabase` (from motion query) into latent z. Frames are selected with a [pandas query](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.query.html) expression over the metric columns and `source_index`: comparisons, `and` / `or` / `not`, arithmetic, `abs`, `a < x < b`, `x in [..]`.
+Turns frames of a `MotionDatabase` (from motion query) into latent z. Frames are selected with a SQL condition (DuckDB) over the metric columns and `source_index`: comparisons, `AND` / `OR` / `NOT`, arithmetic, `abs`, `BETWEEN`, `IN (..)`.
 
 ```bash
 uv run python -m humanoidverse.motion_latent \
     --model_folder /path/to/model \
-    --where "base_speed > 0.5 and abs(move_angle) < 30 and torso_pitch < 15" \
+    --where "base_speed > 0.5 AND abs(move_angle) < 30 AND torso_pitch < 15" \
     --name walk_forward
 ```
 
@@ -363,17 +367,33 @@ By default all selected frames give one z (backward embedding averaged over them
 
 ### Motion vocab
 
-Selects the fixed token vocabulary of holosoma `bfm_walk_token` from the replay buffer. Frames passing `WalkQuery` (torso tilt ≤ 30°, a foot within 0.05 m of the ground, pelvis height, inside the command range) are split into walking-command buckets: stand, low speed, 5 translation tiers of `max(|vx|, |vy|)` and 3 turning tiers of `|yaw_rate|`. Each bucket then keeps its quota of frames pairwise apart in a weighted qpos distance (yaw-free base quaternion, base height and joints, weighted more near the pelvis and on the legs): frames are visited in random order and kept when no kept frame is within a threshold, and the threshold is bisected until the quota is filled. Buckets, quotas (`total` split by command group shares) and weights are in `humanoidverse/config/queries/walk_vocab.yaml`. The buffer is streamed from its hdf5, never loaded whole.
+`scripts/queries/walk_vocab.py` selects the fixed token vocabulary of holosoma `bfm_walk_token` from the replay buffer:
 
-```bash
-uv run python -m humanoidverse.motion_vocab --model_folder /path/to/model --latent
+1. Its query keeps upright frames inside the command range: torso tilt ≤ 30°, a foot within 0.05 m of the ground, wrists below the shoulders, and pelvis height in range.
+2. A `case` splits them into walking-command buckets: stand, low speed, 5 translation tiers of `max(|vx|, |vy|)`, and 3 turning tiers of `|yaw_rate|`.
+3. `SymmetryError` adds each frame's left-right symmetry error.
+4. The chain continues with `.sample(total)`, which picks frames with velocity uniformity > symmetry > pose similarity:
+
+```python
+.sample(total)
+.partition("grp", {"stand": 0.05, "translate": 0.85, "turn": 0.1}, spacing_floor=0.5)
+.stratify(translate=grid(base_vx=0.15, base_vy=0.15, limit=1.05), turn=grid(yaw_rate=0.1, limit=1.05))
+.prefer("symmetry_error", keep=0.5)
+.spread(SIMILARITY)
 ```
 
-`--max_frames N` / `--stride K` scan only part of the buffer for a quick try.
+- `partition` splits the total over the command modes. With `spacing_floor`, a mode too dense to fill its quota with frames far enough apart is capped, and its leftover goes to the others.
+- `stratify` spreads frames evenly over velocity grid cells; a cell short of candidates gives all it has. Its keywords name values of the enclosing `partition`, so stand passes through unchanged.
+- `prefer` keeps the most symmetric half, never fewer than the quota.
+- `spread` keeps frames pairwise apart in a weighted qpos distance (yaw-free base quaternion, base height and joints). Frames are visited in random order and kept when no kept frame is within a threshold, and the threshold is bisected until the quota is filled.
+
+```bash
+uv run python scripts/queries/walk_vocab.py --model-folder /path/to/model --latent
+```
 
 **Outputs** (under `model_folder/motion_vocab/`, or `--output`):
 
-- `motion_db.pkl`: the selected frames, with a `bucket` metric giving the bucket number. Browse it with `motion_viewer` (`where bucket == 3`).
+- `motion_db.pkl`: the selected frames. The `bucket` metric gives the bucket's code, and `db.labels["bucket"]` gives the names. Browse it with `motion_viewer` (`where bucket = 3`).
 - `latent_z.pkl` (with `--latent`): `{bucket name: z}`, one z per frame from goal inference. Bucket names sort in token order, so it can be passed directly to holosoma `scripts/build_bfm_vocab.py`.
 
 Velocities follow the walking command: `base_vx` / `base_vy` are in m/s in the heading frame, and `yaw_rate` is in rad/s.

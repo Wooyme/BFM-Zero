@@ -1,6 +1,0 @@
-# Walking backward; the angle range wraps around +-180.
-type: LocomotionQuery
-min_speed: 0.2
-min_angle: 150
-max_angle: -150
-min_height: 0.6

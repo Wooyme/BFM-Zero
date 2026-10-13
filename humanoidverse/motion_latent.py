@@ -40,6 +40,24 @@ def infer_z(model, frames: dict, per_frame: bool, device="cuda") -> np.ndarray:
     return z.float().cpu().numpy()
 
 
+def load_model(model_folder: Path, device: str = "cuda"):
+    model = load_model_from_checkpoint_dir(Path(model_folder) / "checkpoint", device=device)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def infer_z_by(model_folder: Path, db: MotionDatabase, by: str, per_frame: bool = True, device: str = "cuda") -> dict:
+    """{label: z} for each value of the text column by of db (see MotionDatabase.labels), labels in sorted order."""
+    model = load_model(model_folder, device)
+    z = {}
+    for code, label in enumerate(db.labels[by]):
+        sub = db.select(np.flatnonzero(db.metrics[by] == code))
+        if len(sub):
+            z[label] = infer_z(model, sub.frames, per_frame=per_frame, device=device)
+    return z
+
+
 def main(
     model_folder: Path,
     db: Path | None = None,
@@ -62,7 +80,7 @@ def main(
 
     Args:
         db: MotionDatabase pickle (default: model_folder/motion_query/motion_db.pkl).
-        where: pandas query expression over the metric columns and source_index, e.g.
+        where: SQL condition (DuckDB) over the metric columns and source_index, e.g.
             "base_speed > 0.5 and abs(move_angle) < 30 and not (torso_pitch > 20)".
         sort_by: metric to sort by (descending unless ascending), applied after where.
         limit: keep the first limit frames after where / sort_by.

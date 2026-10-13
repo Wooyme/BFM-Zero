@@ -1,15 +1,26 @@
 """Weighted pose similarity on qpos and threshold-based thinning, used by motion_vocab to drop
-near-duplicate frames inside a command bucket.
+near-duplicate frames inside a command bucket, and a left-right symmetry error to rank frames
+before thinning.
 
 The features are scaled by sqrt(weight) per block, so the Euclidean distance between two feature
 rows is the weighted pose distance. Nothing is forwarded through mujoco: the model only provides
 joint names and qpos addresses.
 """
 
-from typing import Mapping, Tuple
+import functools
+from pathlib import Path
+from typing import Mapping, Sequence, Tuple
 
 import mujoco
 import numpy as np
+
+ENV_MODEL = Path(__file__).resolve().parents[3] / "data" / "robots" / "g1" / "scene_29dof_freebase_noadditional_actuators.xml"
+
+
+@functools.lru_cache(maxsize=None)
+def env_model() -> mujoco.MjModel:
+    """The G1 model buffer qpos refers to (free base, 29 dof)."""
+    return mujoco.MjModel.from_xml_path(str(ENV_MODEL))
 
 # Closer to the pelvis weighs more, legs more than arms.
 DEFAULT_WEIGHTS = {
@@ -66,6 +77,53 @@ def qpos_features(model: mujoco.MjModel, qpos: np.ndarray, weights: Mapping | No
     ).astype(np.float32)
 
 
+def mirror_joints(model: mujoco.MjModel) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Left-right mirror of the hinge joints: qpos addresses, partner column and sign of each.
+
+    The mirror of a pose has q'[j] = sign[j] * q[partner[j]], partner swapping left_ / right_.
+    Reflecting across the sagittal (xz) plane maps a rotation about axis a by angle t to one about
+    R a by -t, so sign = -<axis of partner, R axis>, from the world axes at qpos0: pitch joints
+    keep their sign, roll and yaw joints flip it.
+    """
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    reflect = np.array([1.0, -1.0, 1.0])
+    joints = [j for j in range(model.njnt) if model.jnt_type[j] != mujoco.mjtJoint.mjJNT_FREE]
+    names = [model.joint(j).name for j in joints]
+    partner, sign = [], []
+    for j, name in zip(joints, names):
+        other = name.replace("left_", "\0").replace("right_", "left_").replace("\0", "right_")
+        k = names.index(other)
+        dot = float(np.dot(data.xaxis[joints[k]], reflect * data.xaxis[j]))
+        if abs(abs(dot) - 1.0) > 1e-3:
+            raise ValueError(f"Joints {name} and {other} are not mirror images (axis dot {dot:.3f})")
+        partner.append(k)
+        sign.append(-np.sign(dot))
+    return np.array([model.jnt_qposadr[j] for j in joints]), np.array(partner), np.array(sign, dtype=np.float32)
+
+
+def symmetry_error(model: mujoco.MjModel, qpos: np.ndarray, weights: Mapping | None = None) -> Tuple[np.ndarray, np.ndarray]:
+    """Axial and central left-right symmetry errors of the joint angles of qpos rows, (N,) each.
+
+    With the mirror M of mirror_joints, a pose splits into a symmetric part s = (q + Mq) / 2 and an
+    antisymmetric part a = (q - Mq) / 2. Axial symmetry (q = Mq, e.g. standing) has error |a|;
+    central symmetry about the mean symmetric pose c of the rows (q - c = -(Mq - c), left and
+    right in opposite phase as mid-stride) has error |s - c|. Joints are weighted as in
+    qpos_features, so the errors are in the units of the pose distance.
+    """
+    weights = weights or DEFAULT_WEIGHTS
+    addr, partner, sign = mirror_joints(model)
+    w_addr, joint_w = joint_weights(model, weights["joints"])
+    assert (w_addr == addr).all()
+    q = qpos[:, addr]
+    mirrored = sign * q[:, partner]
+    sym, anti = 0.5 * (q + mirrored), 0.5 * (q - mirrored)
+    w = np.sqrt(joint_w)
+    axial = np.linalg.norm(w * anti, axis=-1)
+    central = np.linalg.norm(w * (sym - sym.mean(axis=0)), axis=-1)
+    return axial, central
+
+
 def _greedy_net(feat: np.ndarray, order: np.ndarray, threshold: float, k: int) -> np.ndarray:
     """Walk rows in order, keeping a row when it is >= threshold from every kept row; stop at k kept."""
     kept = [order[0]]
@@ -108,3 +166,26 @@ def threshold_sample(
         else:
             hi = mid
     return _greedy_net(feat, order, lo, k), lo
+
+
+def net_size(feat: np.ndarray, threshold: float, seed: int = 0) -> int:
+    """Rows threshold_sample keeps at this threshold with no quota (same visiting order)."""
+    if len(feat) == 0:
+        return 0
+    order = np.random.default_rng(seed).permutation(len(feat))
+    return len(_greedy_net(feat, order, threshold, len(feat)))
+
+
+def shared_threshold(feats: Sequence[np.ndarray], total: int, seed: int = 0, iters: int = 30) -> float:
+    """Largest threshold at which thinning every feature set at that one threshold keeps total rows in all."""
+    feats = [f for f in feats if len(f)]
+    if sum(len(f) for f in feats) <= total:
+        return 0.0
+    lo, hi = 0.0, 2.0 * max(float(np.linalg.norm(f - f[0], axis=-1).max()) for f in feats) + 1e-6
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        if sum(net_size(f, mid, seed) for f in feats) >= total:
+            lo = mid
+        else:
+            hi = mid
+    return lo

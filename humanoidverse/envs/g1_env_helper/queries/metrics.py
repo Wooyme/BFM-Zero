@@ -1,18 +1,20 @@
 """Per-frame motion metrics, read from a forwarded mujoco.MjData.
 
-Queries use them to select frames and MotionDatabase uses them to tag frames. To add a metric,
-register a function in METRICS. Angles are in degrees, lengths in m, velocities in m/s
-and angular rates in rad/s (the units of the walking command).
+Each metric is a Metric object computing one quantity; METRICS names them, and those names are the
+columns that motion queries filter on with SQL (see humanoidverse/query/motion_query.py) and that
+MotionDatabase tags frames with. To add a metric, register an instance in METRICS (subclass Metric
+for a new quantity). Angles are in degrees, lengths in m, velocities in m/s and angular rates in
+rad/s (the units of the walking command).
 """
 
-from typing import Callable, Dict
+import abc
+import dataclasses
+from typing import Dict
 
 import mujoco
 import numpy as np
 
 from humanoidverse.envs.g1_env_helper.rewards import get_center_of_mass_linvel, get_xmat, get_xpos, rot2eul
-
-MetricFn = Callable[[mujoco.MjModel, mujoco.MjData], float]
 
 
 def heading_velocity(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
@@ -42,38 +44,154 @@ def joint_deg(model: mujoco.MjModel, data: mujoco.MjData, joint: str) -> float:
     return float(np.rad2deg(data.qpos[model.joint(joint).qposadr[0]]))
 
 
-METRICS: Dict[str, MetricFn] = {
+class Metric(abc.ABC):
+    """One per-frame quantity of a forwarded MjData. Subclasses are frozen dataclasses, so they pickle
+    to the worker processes of bench/motion_metrics.compute_metrics."""
+
+    @abc.abstractmethod
+    def __call__(self, model: mujoco.MjModel, data: mujoco.MjData) -> float: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class BodyHeight(Metric):
+    """World z of a body origin."""
+
+    body: str
+
+    def __call__(self, model, data):
+        return float(get_xpos(model, data, self.body)[2])
+
+
+@dataclasses.dataclass(frozen=True)
+class HeightAbove(Metric):
+    """World z of body minus that of ref."""
+
+    body: str
+    ref: str
+
+    def __call__(self, model, data):
+        return float(get_xpos(model, data, self.body)[2] - get_xpos(model, data, self.ref)[2])
+
+
+@dataclasses.dataclass(frozen=True)
+class FootClearance(Metric):
+    """Height of the lower ankle_roll_link above ground_ankle_height, its height with the sole flat on the ground."""
+
+    ground_ankle_height: float = 0.035
+
+    def __call__(self, model, data):
+        foot = min(get_xpos(model, data, "left_ankle_roll_link")[2], get_xpos(model, data, "right_ankle_roll_link")[2])
+        return float(foot - self.ground_ankle_height)
+
+
+@dataclasses.dataclass(frozen=True)
+class BaseSpeed(Metric):
+    """Horizontal speed of the pelvis."""
+
+    def __call__(self, model, data):
+        return float(np.linalg.norm(data.qvel[0:2]))
+
+
+@dataclasses.dataclass(frozen=True)
+class HeadingVelocity(Metric):
+    """Pelvis velocity in the heading frame along axis: 0 forward, 1 left, 2 up."""
+
+    axis: int
+
+    def __call__(self, model, data):
+        return float(heading_velocity(model, data)[self.axis])
+
+
+@dataclasses.dataclass(frozen=True)
+class MoveAngle(Metric):
+    """Direction of horizontal motion relative to the heading, same convention as move-ego-<angle>-<speed>."""
+
+    def __call__(self, model, data):
+        vx, vy, _ = heading_velocity(model, data)
+        return float(np.rad2deg(np.arctan2(vy, vx)))
+
+
+@dataclasses.dataclass(frozen=True)
+class ComSpeed(Metric):
+    """Horizontal speed of the center of mass, the quantity LocomotionReward scores on."""
+
+    def __call__(self, model, data):
+        return float(np.linalg.norm(get_center_of_mass_linvel(model, data)[0:2]))
+
+
+@dataclasses.dataclass(frozen=True)
+class YawRate(Metric):
+    """Pelvis angular velocity about the world vertical."""
+
+    def __call__(self, model, data):
+        return float(world_angvel(model, data)[2])
+
+
+@dataclasses.dataclass(frozen=True)
+class EulerAngle(Metric):
+    """Euler angle of a body (0 roll, 1 pitch, 2 yaw), in degrees."""
+
+    body: str
+    axis: int
+
+    def __call__(self, model, data):
+        return euler_deg(model, data, self.body, self.axis)
+
+
+@dataclasses.dataclass(frozen=True)
+class Tilt(Metric):
+    """Deviation of a body from upright in any direction, in degrees."""
+
+    body: str
+
+    def __call__(self, model, data):
+        return tilt_deg(model, data, self.body)
+
+
+@dataclasses.dataclass(frozen=True)
+class JointAngle(Metric):
+    """offset + scale * joint angle, in degrees."""
+
+    joint: str
+    scale: float = 1.0
+    offset: float = 0.0
+
+    def __call__(self, model, data):
+        return self.offset + self.scale * joint_deg(model, data, self.joint)
+
+
+METRICS: Dict[str, Metric] = {
     # base (pelvis) position / velocity
-    "base_height": lambda m, d: float(get_xpos(m, d, "pelvis")[2]),
-    "base_speed": lambda m, d: float(np.linalg.norm(d.qvel[0:2])),
-    "base_vx": lambda m, d: float(heading_velocity(m, d)[0]),
-    "base_vy": lambda m, d: float(heading_velocity(m, d)[1]),
-    "base_vz": lambda m, d: float(d.qvel[2]),
-    # direction of horizontal motion relative to heading, same convention as move-ego-<angle>-<speed>
-    "move_angle": lambda m, d: float(np.rad2deg(np.arctan2(*heading_velocity(m, d)[[1, 0]]))),
-    # same quantity LocomotionReward scores on
-    "com_speed": lambda m, d: float(np.linalg.norm(get_center_of_mass_linvel(m, d)[0:2])),
-    "yaw_rate": lambda m, d: float(world_angvel(m, d)[2]),
+    "base_height": BodyHeight("pelvis"),
+    "base_speed": BaseSpeed(),
+    "base_vx": HeadingVelocity(0),
+    "base_vy": HeadingVelocity(1),
+    "base_vz": HeadingVelocity(2),
+    "move_angle": MoveAngle(),
+    "com_speed": ComSpeed(),
+    "yaw_rate": YawRate(),
     # orientation
-    "base_roll": lambda m, d: euler_deg(m, d, "pelvis", 0),
-    "base_pitch": lambda m, d: euler_deg(m, d, "pelvis", 1),
-    "torso_roll": lambda m, d: euler_deg(m, d, "torso_link", 0),
-    "torso_pitch": lambda m, d: euler_deg(m, d, "torso_link", 1),
-    # deviation from upright in any direction
-    "base_tilt": lambda m, d: tilt_deg(m, d, "pelvis"),
-    "torso_tilt": lambda m, d: tilt_deg(m, d, "torso_link"),
+    "base_roll": EulerAngle("pelvis", 0),
+    "base_pitch": EulerAngle("pelvis", 1),
+    "torso_roll": EulerAngle("torso_link", 0),
+    "torso_pitch": EulerAngle("torso_link", 1),
+    "base_tilt": Tilt("pelvis"),
+    "torso_tilt": Tilt("torso_link"),
     # arm joints. G1 elbow joint 0 is a right angle and +90 deg a straight arm, so flexion = 90 - joint
     # (0 straight, larger is more bent); abduction is positive when the arm swings away from the body
-    "left_elbow_flexion": lambda m, d: 90.0 - joint_deg(m, d, "left_elbow_joint"),
-    "right_elbow_flexion": lambda m, d: 90.0 - joint_deg(m, d, "right_elbow_joint"),
-    "left_arm_abduction": lambda m, d: joint_deg(m, d, "left_shoulder_roll_joint"),
-    "right_arm_abduction": lambda m, d: -joint_deg(m, d, "right_shoulder_roll_joint"),
+    "left_elbow_flexion": JointAngle("left_elbow_joint", scale=-1.0, offset=90.0),
+    "right_elbow_flexion": JointAngle("right_elbow_joint", scale=-1.0, offset=90.0),
+    "left_arm_abduction": JointAngle("left_shoulder_roll_joint"),
+    "right_arm_abduction": JointAngle("right_shoulder_roll_joint", scale=-1.0),
     # body part heights
-    "torso_height": lambda m, d: float(get_xpos(m, d, "torso_link")[2]),
-    "left_hand_height": lambda m, d: float(get_xpos(m, d, "left_rubber_hand")[2]),
-    "right_hand_height": lambda m, d: float(get_xpos(m, d, "right_rubber_hand")[2]),
-    "left_knee_height": lambda m, d: float(get_xpos(m, d, "left_knee_link")[2]),
-    "right_knee_height": lambda m, d: float(get_xpos(m, d, "right_knee_link")[2]),
-    "left_foot_height": lambda m, d: float(get_xpos(m, d, "left_ankle_roll_link")[2]),
-    "right_foot_height": lambda m, d: float(get_xpos(m, d, "right_ankle_roll_link")[2]),
+    "torso_height": BodyHeight("torso_link"),
+    "left_hand_height": BodyHeight("left_rubber_hand"),
+    "right_hand_height": BodyHeight("right_rubber_hand"),
+    "left_knee_height": BodyHeight("left_knee_link"),
+    "right_knee_height": BodyHeight("right_knee_link"),
+    "left_foot_height": BodyHeight("left_ankle_roll_link"),
+    "right_foot_height": BodyHeight("right_ankle_roll_link"),
+    "foot_clearance": FootClearance(0.035),
+    "left_wrist_above_shoulder": HeightAbove("left_wrist_roll_link", "left_shoulder_pitch_link"),
+    "right_wrist_above_shoulder": HeightAbove("right_wrist_roll_link", "right_shoulder_pitch_link"),
 }

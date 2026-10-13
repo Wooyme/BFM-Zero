@@ -506,6 +506,20 @@ wheels = [
 ]
 
 [[package]]
+name = "duckdb"
+version = "1.5.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/59/0b/d65ea3be00ea79aa276a8388bec588a9cbf409ce637c6d306e5316210d15/duckdb-1.5.6.tar.gz", hash = "sha256:166a91dbfacfc0c9f08cc76c0243cb6d3d4296bfab5bad72a3cfb63140a5b7c8", size = 18032957, upload-time = "2026-09-28T13:38:37.978Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/58/e1/5d05ecb59e3fd401414dacc9c969a326fe3a0b1eb07920058b656fe728d6/duckdb-1.5.6-cp310-cp310-macosx_10_9_universal2.whl", hash = "sha256:64db8a6700e81fe419fba130d8f1780686ad40fbf2eb69f78d2a1533728a0549", size = 32758341, upload-time = "2026-09-28T13:37:14.588Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/d0/a382d9677097a1493049ae38f8219d751db989bfc72bf3a3766dc5af038e/duckdb-1.5.6-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:d6d1eac4de11779bb249b89b0544916ad65751da031df5c5f6d779c85b753109", size = 17372329, upload-time = "2026-09-28T13:37:17.997Z" },
+    { url = "https://files.pythonhosted.org/packages/5c/dc/76577ce6520db9e4e8b33f90ec2f503cbf79652a1fd34e391b8043f921f2/duckdb-1.5.6-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:56355a543a79c7f4d8576d27edcbd9aaed19a562a0901188b021c10f4c818800", size = 15511297, upload-time = "2026-09-28T13:37:20.236Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/3e/eeeef69e0c3cf3bb463b544435695647a4802437cfcc2b94035026bf5f84/duckdb-1.5.6-cp310-cp310-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:95a6b91bb9149950baeb5d02466c006550d0ea98b9d10f15f7d614a8eb32e174", size = 19428638, upload-time = "2026-09-28T13:37:22.436Z" },
+    { url = "https://files.pythonhosted.org/packages/58/05/4ed0a651d55c8cbf9f7e826cfa95e67c9955a5db22a0c7c0cc5378f4a90c/duckdb-1.5.6-cp310-cp310-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:dbd348e9ebdc8b28f1f9930efb5a74a382063c35d9c43901075566fbae50ab5c", size = 21534632, upload-time = "2026-09-28T13:37:25.139Z" },
+    { url = "https://files.pythonhosted.org/packages/33/34/66f49f13f4286871e54b8d5478fb0b10e1f334f6ffe81536213e7fb55f09/duckdb-1.5.6-cp310-cp310-win_amd64.whl", hash = "sha256:f14551eef9180fc72869e2d9a2896410a8826169e22495e98a825abaa0eac1a7", size = 13178288, upload-time = "2026-09-28T13:37:27.578Z" },
+]
+
+[[package]]
 name = "easydict"
 version = "1.13"
 source = { registry = "https://pypi.org/simple" }
@@ -1857,6 +1871,7 @@ name = "motivo-isaac"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "duckdb" },
     { name = "easydict" },
     { name = "exca" },
     { name = "hf-xet" },
@@ -1899,6 +1914,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "duckdb", specifier = ">=1.1" },
     { name = "easydict", specifier = ">=1.13" },
     { name = "exca", specifier = ">=0.2.5" },
     { name = "hf-xet", specifier = ">=1.1.2" },
