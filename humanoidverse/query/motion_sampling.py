@@ -2,7 +2,7 @@
 
     query.sample(4000)
     .partition("grp", {"stand": 0.05, "translate": 0.85, "turn": 0.1}, spacing_floor=0.5)
-    .stratify(translate=grid(base_vx=0.15, base_vy=0.15, limit=1.05), turn=grid(yaw_rate=0.1, limit=1.05))
+    .stratify({"translate": grid(base_vx=0.15, base_vy=0.15, range=(-1.05, 1.05)), "turn": grid(yaw_rate=0.1, range=(-1.05, 1.05))}, by="grp")
     .prefer("symmetry_error", keep=0.5)
     .spread(weights)
 
@@ -11,8 +11,9 @@
     prefer     keep the rows lowest in a column (a share, but never fewer than n)
     spread     keep n rows pairwise apart in weighted qpos distance (similarity thinning)
 
-A stage after a partition can differ per value of it: stratify(translate=..., turn=...) stratifies
-those values and passes the others through. The chain builds a tree of the Sampler classes below
+A stratify can differ per value of an enclosing partition, named by its column: stratify({"translate":
+..., "turn": ...}, by="grp") stratifies those values of grp and passes the others through; without by,
+its grid applies to all rows. The chain builds a tree of the Sampler classes below
 (Partition, Stratify, Prefer, Spread, Head). SymmetryError is a column function for
 Query.with_columns, giving the column prefer sorts on.
 """
@@ -34,6 +35,7 @@ def allocate(quota: Sequence[float], cap: Sequence[int], total: int) -> list[int
 
     A bucket whose proportional share exceeds its cap keeps its cap, and the rest is shared again
     among the others, until no share exceeds its cap (then fewer than total if all are capped).
+    Shares are rounded by largest remainder, so they sum to exactly total.
     """
     quota, cap = np.asarray(quota, dtype=np.float64), np.asarray(cap, dtype=np.int64)
     out = np.zeros(len(quota), dtype=np.int64)
@@ -42,7 +44,12 @@ def allocate(quota: Sequence[float], cap: Sequence[int], total: int) -> list[int
         share = (total - out[~free].sum()) * quota / quota[free].sum()
         over = free & (cap < share)
         if not over.any():
-            out[free] = np.round(share[free]).astype(np.int64)
+            # largest remainder: floor each share, then one more to the largest fractional parts
+            idx = np.flatnonzero(free)
+            base = np.floor(share[idx]).astype(np.int64)
+            left = int(round(total - out[~free].sum() - base.sum()))
+            base[np.argsort(-(share[idx] - base), kind="stable")[:left]] += 1
+            out[idx] = base
             break
         out[over] = cap[over]
         free &= ~over
@@ -51,23 +58,32 @@ def allocate(quota: Sequence[float], cap: Sequence[int], total: int) -> list[int
 
 @dataclasses.dataclass(frozen=True)
 class Cell:
-    """Grid axis of Stratify: cells of width size aligned at 0, values beyond +-limit in the outermost cells."""
+    """Grid axis of Stratify: cells of width size from lo to hi (edges at lo + k * size), values outside
+    [lo, hi] in the outermost cells; e.g. Cell(0.15, -1.05, 1.05) is 7 cells each side of 0."""
 
     size: float
-    limit: float
+    lo: float
+    hi: float
+
+    @property
+    def count(self) -> int:
+        return int(np.ceil((self.hi - self.lo) / self.size - 1e-6))
+
+    def edge(self, k: int) -> float:
+        """Lower edge of cell k."""
+        return self.lo + k * self.size
 
 
-def grid(limit: float, **sizes: float) -> dict[str, Cell]:
-    """Grid of Stratify, e.g. grid(base_vx=0.15, base_vy=0.15, limit=1.05)."""
-    return {name: Cell(size, limit) for name, size in sizes.items()}
+def grid(range: tuple[float, float], **sizes: float) -> dict[str, Cell]:
+    """Grid of Stratify, the same range on each axis, e.g. grid(base_vx=0.15, base_vy=0.15, range=(-1.05, 1.05))."""
+    return {name: Cell(size, *range) for name, size in sizes.items()}
 
 
 def grid_cells(df: pd.DataFrame | Mapping[str, np.ndarray], cells: Mapping[str, Cell]) -> np.ndarray:
     """(N, len(cells)) cell index of each row on the grid of cells."""
     keys = []
     for name, cell in cells.items():
-        n = int(np.ceil(cell.limit / cell.size - 1e-6))
-        keys.append(np.clip(np.floor(np.asarray(df[name]) / cell.size), -n, n - 1).astype(np.int64))
+        keys.append(np.clip(np.floor((np.asarray(df[name]) - cell.lo) / cell.size), 0, cell.count - 1).astype(np.int64))
     return np.stack(keys, axis=-1)
 
 
@@ -77,7 +93,7 @@ def print_uniformity(cells: Mapping[str, Cell], keys: np.ndarray, counts: np.nda
     short = cell_quota >= counts
     full = cell_quota[~short]
     print(
-        f"Stratify {list(cells)}: {cell_quota.sum()}/{target} frames over {len(keys)} cells, "
+        f"Stratify {list(cells)}: {cell_quota.sum()}/{target} frames from {counts.sum()} candidates over {len(keys)} cells, "
         f"{(~short).sum()} at {full.max() if len(full) else '-'} frames, {short.sum()} short (all {cell_quota[short].sum()} candidates taken)"
     )
     names = list(cells)
@@ -86,12 +102,12 @@ def print_uniformity(cells: Mapping[str, Cell], keys: np.ndarray, counts: np.nda
         grid = np.zeros(hi - lo + 1, dtype=np.int64)
         grid[tuple((keys - lo).T)] = cell_quota
         a, b = cells[names[0]], cells[names[1]]
-        print(f"  rows {names[0]} from {lo[0] * a.size:+.2f}, cols {names[1]} from {lo[1] * b.size:+.2f}, step {a.size}/{b.size}")
+        print(f"  rows {names[0]} from {a.edge(lo[0]):+.2f}, cols {names[1]} from {b.edge(lo[1]):+.2f}, step {a.size}/{b.size}")
         for r in grid:
             print("  " + " ".join(f"{v:4d}" for v in r))
     elif len(names) == 1:
-        size = cells[names[0]].size
-        print("  " + " ".join(f"{k[0] * size:+.2f}:{q}" for k, q in zip(keys, cell_quota)))
+        cell = cells[names[0]]
+        print("  " + " ".join(f"{cell.edge(k[0]):+.2f}:{q}" for k, q in zip(keys, cell_quota)))
 
 
 class Sampler(abc.ABC):
@@ -274,21 +290,13 @@ class Partition(Sampler):
 
 @dataclasses.dataclass(frozen=True)
 class SymmetryError:
-    """Column function: the better of axial and central left-right symmetry error of each row
-    (bench/motion_similarity.symmetry_error), central about the mean pose of its by partition."""
+    """Column function: the left-right symmetry error of each row (bench/motion_similarity.symmetry_error),
+    pitch joints axially or centrally symmetric about the default pose, roll and yaw joints axially."""
 
-    by: str | None = None
     weights: Mapping | None = None
 
     def __call__(self, df: pd.DataFrame) -> np.ndarray:
-        qpos = qpos_of(df)
-        err = np.zeros(len(df), dtype=np.float32)
-        parts = [np.arange(len(df))] if self.by is None else [np.flatnonzero(df[self.by].to_numpy() == k) for k in pd.unique(df[self.by])]
-        for rows in parts:
-            if len(rows):
-                axial, central = symmetry_error(env_model(), qpos[rows], self.weights)
-                err[rows] = np.minimum(axial, central)
-        return err
+        return symmetry_error(env_model(), qpos_of(df), self.weights).astype(np.float32)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -304,20 +312,19 @@ class Chain(Sampler):
     query: object = None  # motion_query.Query
     n: int | None = None
 
-    def _add(self, kind: str, *args, per_value: Mapping | None = None, **kwargs) -> "Chain":
+    def _add(self, kind: str, *args, **kwargs) -> "Chain":
         if self.stages and self.stages[-1][0] == "spread":
             raise ValueError("spread must be the last stage")
-        return dataclasses.replace(self, stages=self.stages + ((kind, args, kwargs, dict(per_value or {})),))
+        return dataclasses.replace(self, stages=self.stages + ((kind, args, kwargs),))
 
     def partition(self, by: str, share: Mapping[str, float] | None = None, spacing_floor: float | None = None, report: Sequence[str] = ("base_vx", "base_vy", "yaw_rate")) -> "Chain":
         """Split n over the values of column by, in proportion to share or equally. spacing_floor: see Partition."""
         return self._add("partition", by, share=share, spacing_floor=spacing_floor, report=tuple(report))
 
-    def stratify(self, cells: Mapping[str, Cell] | None = None, **per_value: Mapping[str, Cell]) -> "Chain":
-        """Uniform over the grid cells (see grid); or per value of the enclosing partition, others passed through."""
-        if (cells is None) == (not per_value):
-            raise ValueError("stratify takes cells, or cells per value of the enclosing partition")
-        return self._add("stratify", cells, per_value=per_value)
+    def stratify(self, cells: Mapping, by: str | None = None) -> "Chain":
+        """Uniform over the grid cells (see grid), for all rows; with by, cells is {value: grid} per value
+        of the enclosing partition on column by, the values it lacks passed through."""
+        return self._add("stratify", dict(cells), by=by)
 
     def prefer(self, by: str, keep: float) -> "Chain":
         """Keep the keep share of rows lowest in column by, but never fewer than n."""
@@ -328,7 +335,7 @@ class Chain(Sampler):
         return self._add("spread", weights=weights, min_dist=min_dist, seed=seed)
 
     def build(self) -> Sampler:
-        return _build(self.stages, None)
+        return _build(self.stages, {})
 
     def __call__(self, df: pd.DataFrame, n: int, min_dist: float | None = None) -> np.ndarray:
         return self.build()(df, n, min_dist)
@@ -363,31 +370,41 @@ def sample() -> Chain:
     return Chain()
 
 
-def _build(stages: tuple, value) -> Sampler:
-    """Sampler of stages, for value of the enclosing partition (None outside one / for other values)."""
+def _build(stages: tuple, values: Mapping[str, object]) -> Sampler:
+    """Sampler of stages, for the values {column: value} of the enclosing partitions."""
     if not stages:
         return Head()
-    (kind, args, kwargs, per_value), rest = stages[0], stages[1:]
+    (kind, args, kwargs), rest = stages[0], stages[1:]
     if kind == "spread":
         return Spread(**kwargs)
     if kind == "prefer":
-        return Prefer(*args, then=_build(rest, value))
+        return Prefer(*args, then=_build(rest, values))
     if kind == "stratify":
-        cells = per_value.get(value) if per_value else args[0]
-        return Stratify(cells, then=_build(rest, value)) if cells is not None else _build(rest, value)
-    # partition: one child per value named by share or by the per-value stages up to the next partition
+        by = kwargs["by"]
+        if by is None:
+            cells = args[0]
+        elif by not in values:
+            raise ValueError(f"stratify by {by!r}: no enclosing partition on {by!r}")
+        else:
+            cells = args[0].get(values[by])
+        return Stratify(cells, then=_build(rest, values)) if cells is not None else _build(rest, values)
+    # partition: one child per value named by share or by the per-value stages up to the next partition on by
     by = args[0]
-    values = set(kwargs["share"] or ())
+    share = kwargs["share"]
+    named = set()
     for stage in rest:
-        if stage[0] == "partition":
+        if stage[0] == "partition" and stage[1][0] == by:
             break
-        values |= set(stage[3])
+        if stage[0] == "stratify" and stage[2]["by"] == by:
+            named |= set(stage[1][0])
+    if share is not None and named - set(share):
+        raise ValueError(f"Partition {by}: stratify values {sorted(named - set(share))} missing from share {list(share)}")
     weights = next((stage[2]["weights"] for stage in rest if stage[0] == "spread"), None)
     return Partition(
         by,
-        then={v: _build(rest, v) for v in sorted(values)},
-        default=_build(rest, None),
-        share=kwargs["share"],
+        then={v: _build(rest, {**values, by: v}) for v in sorted(set(share or ()) | named)},
+        default=_build(rest, {**values, by: None}),
+        share=share,
         spacing_floor=kwargs["spacing_floor"],
         weights=weights,
         report=kwargs["report"],

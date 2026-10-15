@@ -46,7 +46,7 @@ from humanoidverse.envs.g1_env_helper.bench.motion_metrics import MotionDatabase
 from humanoidverse.envs.g1_env_helper.bench.motion_similarity import env_model
 from humanoidverse.envs.g1_env_helper.queries import METRICS
 
-HUMANOIDVERSE_DIR = Path(__file__).resolve().parent
+HUMANOIDVERSE_DIR = Path(__file__).resolve().parent.parent
 
 # Python column function: the table -> one value per row
 ColumnFn = Callable[[pd.DataFrame], np.ndarray]
@@ -241,7 +241,7 @@ class Query:
 
     def with_columns(self, **columns: str | ColumnFn) -> "Query":
         """Add or replace columns: a SQL expression (row-local) or a Python column function, e.g.
-        with_columns(cmd_speed="greatest(abs(base_vx), abs(base_vy))", symmetry_error=SymmetryError("bucket"))."""
+        with_columns(cmd_speed="greatest(abs(base_vx), abs(base_vy))", symmetry_error=SymmetryError())."""
         query = self
         for name, column in columns.items():
             query = query._then(SqlColumnOp(name, column) if isinstance(column, str) else ColumnOp(name, column))

@@ -13,14 +13,27 @@ from typing import Mapping, Sequence, Tuple
 
 import mujoco
 import numpy as np
+import yaml
 
 ENV_MODEL = Path(__file__).resolve().parents[3] / "data" / "robots" / "g1" / "scene_29dof_freebase_noadditional_actuators.xml"
+ROBOT_CONFIG = Path(__file__).resolve().parents[3] / "config" / "robot" / "g1" / "g1_29dof.yaml"
 
 
 @functools.lru_cache(maxsize=None)
 def env_model() -> mujoco.MjModel:
     """The G1 model buffer qpos refers to (free base, 29 dof)."""
     return mujoco.MjModel.from_xml_path(str(ENV_MODEL))
+
+
+def default_pose(model: mujoco.MjModel) -> np.ndarray:
+    """(nq,) qpos with the joints at the default joint angles of the robot config (a left-right
+    symmetric stance, slightly crouched), qpos0 elsewhere."""
+    angles = yaml.safe_load(ROBOT_CONFIG.read_text())["robot"]["init_state"]["default_joint_angles"]
+    qpos = model.qpos0.copy()
+    for name, angle in angles.items():
+        qpos[model.joint(name).qposadr[0]] = angle
+    return qpos
+
 
 # Closer to the pelvis weighs more, legs more than arms.
 DEFAULT_WEIGHTS = {
@@ -102,26 +115,31 @@ def mirror_joints(model: mujoco.MjModel) -> Tuple[np.ndarray, np.ndarray, np.nda
     return np.array([model.jnt_qposadr[j] for j in joints]), np.array(partner), np.array(sign, dtype=np.float32)
 
 
-def symmetry_error(model: mujoco.MjModel, qpos: np.ndarray, weights: Mapping | None = None) -> Tuple[np.ndarray, np.ndarray]:
-    """Axial and central left-right symmetry errors of the joint angles of qpos rows, (N,) each.
+def symmetry_error(
+    model: mujoco.MjModel, qpos: np.ndarray, weights: Mapping | None = None, center: np.ndarray | None = None
+) -> np.ndarray:
+    """Left-right symmetry error of the joint angles of each qpos row on its own, (N,).
 
     With the mirror M of mirror_joints, a pose splits into a symmetric part s = (q + Mq) / 2 and an
-    antisymmetric part a = (q - Mq) / 2. Axial symmetry (q = Mq, e.g. standing) has error |a|;
-    central symmetry about the mean symmetric pose c of the rows (q - c = -(Mq - c), left and
-    right in opposite phase as mid-stride) has error |s - c|. Joints are weighted as in
-    qpos_features, so the errors are in the units of the pose distance.
+    antisymmetric part a = (q - Mq) / 2. A pitch joint (mirror sign +1, the axis of the gait swing)
+    may be axially symmetric (left = right) or centrally symmetric about the center c (left and right
+    deviating from c by opposite amounts, e.g. the hips mid-stride), each joint on its own: its error
+    is min(|a|, |s - c|) = ||l - c| - |r - c|| / 2, left and right off c by the same amount. A roll or
+    yaw joint (sign -1) must be axially symmetric, error |a|: opposite deviations there lean or turn
+    both limbs to one side, and the waist roll and yaw count in full. c is the qpos center,
+    default_pose by default. Joints are weighted as in qpos_features, so the error is in the units
+    of the pose distance.
     """
     weights = weights or DEFAULT_WEIGHTS
+    center = default_pose(model) if center is None else center
     addr, partner, sign = mirror_joints(model)
     w_addr, joint_w = joint_weights(model, weights["joints"])
     assert (w_addr == addr).all()
     q = qpos[:, addr]
     mirrored = sign * q[:, partner]
     sym, anti = 0.5 * (q + mirrored), 0.5 * (q - mirrored)
-    w = np.sqrt(joint_w)
-    axial = np.linalg.norm(w * anti, axis=-1)
-    central = np.linalg.norm(w * (sym - sym.mean(axis=0)), axis=-1)
-    return axial, central
+    err = np.where(sign > 0, np.minimum(np.abs(anti), np.abs(sym - center[addr])), np.abs(anti))
+    return np.linalg.norm(np.sqrt(joint_w) * err, axis=-1)
 
 
 def _greedy_net(feat: np.ndarray, order: np.ndarray, threshold: float, k: int) -> np.ndarray:

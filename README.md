@@ -369,21 +369,28 @@ By default all selected frames give one z (backward embedding averaged over them
 
 `scripts/queries/walk_vocab.py` selects the fixed token vocabulary of holosoma `bfm_walk_token` from the replay buffer:
 
-1. Its query keeps upright frames inside the command range: torso tilt ≤ 30°, a foot within 0.05 m of the ground, wrists below the shoulders, and pelvis height in range.
-2. A `case` splits them into walking-command buckets: stand, low speed, 5 translation tiers of `max(|vx|, |vy|)`, and 3 turning tiers of `|yaw_rate|`.
-3. `SymmetryError` adds each frame's left-right symmetry error.
-4. The chain continues with `.sample(total)`, which picks frames with velocity uniformity > symmetry > pose similarity:
+1. Its query keeps frames with a foot within 0.05 m of the ground and wrists below the shoulders, inside the command range. They are either upright (pelvis height 0.55–1.0 m, torso tilt ≤ 30°) or a static low posture: pelvis height < 0.55 m, torso tilt ≤ 100° (unsigned, about 90° lying prone or supine), and `|vx|`, `|vy|`, `|yaw_rate|` < 0.05.
+2. A `case` splits them into buckets: stand, low speed, 5 translation tiers of `max(|vx|, |vy|)`, 3 turning tiers of `|yaw_rate|`, and `10_posture` (every frame below 0.55 m, from squat to kneel to lying).
+3. `SymmetryError` adds each frame's left-right symmetry error, scored on its own: each pitch joint (the gait swing axis) may be axially symmetric (left = right) or centrally symmetric (left and right deviating oppositely from the default pose), each roll or yaw joint, waist included, must be axially symmetric.
+4. The chain continues with `.sample(total)`, which picks frames with velocity (posture: height and tilt) uniformity > symmetry > pose similarity:
 
 ```python
 .sample(total)
-.partition("grp", {"stand": 0.05, "translate": 0.85, "turn": 0.1}, spacing_floor=0.5)
-.stratify(translate=grid(base_vx=0.15, base_vy=0.15, limit=1.05), turn=grid(yaw_rate=0.1, limit=1.05))
+.partition("grp", {"stand": 0.05, "translate": 0.72, "turn": 0.08, "posture": 0.15}, spacing_floor=0.5)
+.stratify(
+    {
+        "translate": grid(base_vx=0.15, base_vy=0.15, range=(-1.05, 1.05)),
+        "turn": grid(yaw_rate=0.1, range=(-1.05, 1.05)),
+        "posture": {"base_height": Cell(0.05, 0, 0.55), "torso_tilt": Cell(10, 0, 90)},
+    },
+    by="grp",
+)
 .prefer("symmetry_error", keep=0.5)
 .spread(SIMILARITY)
 ```
 
 - `partition` splits the total over the command modes. With `spacing_floor`, a mode too dense to fill its quota with frames far enough apart is capped, and its leftover goes to the others.
-- `stratify` spreads frames evenly over velocity grid cells; a cell short of candidates gives all it has. Its keywords name values of the enclosing `partition`, so stand passes through unchanged.
+- `stratify` spreads frames evenly over velocity grid cells (posture: 0.05 m pelvis height × 10° torso tilt cells, tilt above 90° in the last); a cell short of candidates gives all it has. `by="grp"` keys its grids by the values of the enclosing `partition` on `grp`, so stand passes through unchanged; without `by`, one grid applies to all rows.
 - `prefer` keeps the most symmetric half, never fewer than the quota.
 - `spread` keeps frames pairwise apart in a weighted qpos distance (yaw-free base quaternion, base height and joints). Frames are visited in random order and kept when no kept frame is within a threshold, and the threshold is bisected until the quota is filled.
 
