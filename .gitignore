@@ -3,3 +3,4 @@
 /.venv/
 /.idea/
 /motivo_isaac.egg-info/
+/model/checkpoint/model/
