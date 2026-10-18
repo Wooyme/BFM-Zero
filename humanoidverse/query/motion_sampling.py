@@ -11,7 +11,8 @@
     prefer     keep the rows lowest in a column (a share, but never fewer than n)
     spread     keep n rows pairwise apart in weighted qpos distance (similarity thinning)
 
-A stratify can differ per value of an enclosing partition, named by its column: stratify({"translate":
+With plot (a folder), each stratify saves the distribution of its picks over the grid as
+stratify_<partition values>.png. A stratify can differ per value of an enclosing partition, named by its column: stratify({"translate":
 ..., "turn": ...}, by="grp") stratifies those values of grp and passes the others through; without by,
 its grid applies to all rows. The chain builds a tree of the Sampler classes below
 (Partition, Stratify, Prefer, Spread, Head). SymmetryError is a column function for
@@ -20,6 +21,9 @@ Query.with_columns, giving the column prefer sorts on.
 
 import abc
 import dataclasses
+import itertools
+from pathlib import Path
+import re
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -27,7 +31,7 @@ import pandas as pd
 import rich
 
 from humanoidverse.envs.g1_env_helper.bench.motion_metrics import qpos_of
-from humanoidverse.envs.g1_env_helper.bench.motion_similarity import env_model, net_size, qpos_features, shared_threshold, symmetry_error, threshold_sample
+from humanoidverse.envs.g1_env_helper.bench.motion_similarity import env_model, net_size, parallel_map, qpos_features, shared_threshold, symmetry_error, threshold_sample
 
 
 def allocate(quota: Sequence[float], cap: Sequence[int], total: int) -> list[int]:
@@ -108,6 +112,67 @@ def print_uniformity(cells: Mapping[str, Cell], keys: np.ndarray, counts: np.nda
     elif len(names) == 1:
         cell = cells[names[0]]
         print("  " + " ".join(f"{cell.edge(k[0]):+.2f}:{q}" for k, q in zip(keys, cell_quota)))
+
+
+def plot_uniformity(cells: Mapping[str, Cell], keys: np.ndarray, counts: np.ndarray, selected: Sequence[int], path: Path, title: str):
+    """Picks of a Stratify over its grid, saved to path: per axis, the picks (bars) and candidates
+    (dots, log scale) of each cell summed over the other axes; per pair of axes, a heatmap of the
+    picks (blank: no candidates)."""
+    from matplotlib.figure import Figure  # no pyplot: no backend, safe in worker processes
+
+    names = list(cells)
+    selected = np.asarray(selected, dtype=np.float64)
+    pairs = list(itertools.combinations(range(len(names)), 2))
+    ncols = max(len(names), len(pairs))
+    fig = Figure(figsize=(4.5 * ncols, 3.8 * (1 + bool(pairs))), layout="constrained")
+    axes = fig.subplots(1 + bool(pairs), ncols, squeeze=False)
+    for ax in axes.flat:
+        ax.set_visible(False)
+    for i, name in enumerate(names):
+        cell = cells[name]
+        x = cell.lo + (np.arange(cell.count) + 0.5) * cell.size
+        ax = axes[0, i]
+        ax.set_visible(True)
+        ax.bar(x, np.bincount(keys[:, i], weights=selected, minlength=cell.count), width=0.9 * cell.size)
+        ax.set_xlabel(name)
+        ax.set_ylabel("selected")
+        cand = np.bincount(keys[:, i], weights=counts, minlength=cell.count)
+        twin = ax.twinx()
+        twin.plot(x[cand > 0], cand[cand > 0], "k.--", lw=0.8)
+        twin.set_yscale("log")
+        twin.set_ylabel("candidates")
+    for j, (a, b) in enumerate(pairs):
+        ca, cb = cells[names[a]], cells[names[b]]
+        heat = np.zeros((ca.count, cb.count))
+        cand = np.zeros((ca.count, cb.count))
+        np.add.at(heat, (keys[:, a], keys[:, b]), selected)
+        np.add.at(cand, (keys[:, a], keys[:, b]), counts)
+        heat[cand == 0] = np.nan
+        ax = axes[1, j]
+        ax.set_visible(True)
+        extent = (ca.lo, ca.edge(ca.count), cb.lo, cb.edge(cb.count))
+        im = ax.imshow(heat.T, origin="lower", extent=extent, aspect="auto", cmap="viridis", interpolation="nearest")
+        if heat.size <= 400:
+            for (u, v), h in np.ndenumerate(heat):
+                if not np.isnan(h):
+                    ax.text(ca.edge(u) + ca.size / 2, cb.edge(v) + cb.size / 2, f"{h:.0f}", ha="center", va="center", fontsize=6, color="w")
+        ax.set_xlabel(names[a])
+        ax.set_ylabel(names[b])
+        fig.colorbar(im, ax=ax, label="selected")
+    fig.suptitle(f"{title}: {int(selected.sum())} selected from {int(counts.sum())} candidates over {len(keys)} cells")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=120)
+    print(f"  saved {path}")
+
+
+def _sample(args) -> np.ndarray:
+    sampler, df, n = args
+    return sampler(df, n)
+
+
+def _capacity(args) -> int:
+    sampler, df, dist = args
+    return sampler.capacity(df, dist)
 
 
 class Sampler(abc.ABC):
@@ -192,6 +257,8 @@ class Stratify(Sampler):
 
     cells: Mapping[str, Cell]
     then: Sampler
+    plot: Path | None = None  # folder of the distribution plot
+    name: str = "all"  # values of the enclosing partitions, naming the plot
 
     def __call__(self, df: pd.DataFrame, n: int, min_dist: float | None = None) -> np.ndarray:
         if len(df) == 0 or n <= 0:
@@ -199,11 +266,17 @@ class Stratify(Sampler):
         keys, inverse, counts = np.unique(grid_cells(df, self.cells), axis=0, return_inverse=True, return_counts=True)
         inverse = inverse.reshape(-1)
         cell_quota = allocate([1] * len(keys), counts.tolist(), n)
-        sel = []
-        for c, q in enumerate(cell_quota):
-            members = np.flatnonzero(inverse == c)
-            sel.append(members[self.then(df.iloc[members], q)])
+        # cells are independent: sampled on the shared pool, the largest first
+        members = [np.flatnonzero(inverse == c) for c in range(len(keys))]
+        cells = sorted(range(len(keys)), key=lambda c: -len(members[c]))
+        picked = parallel_map(_sample, [(self.then, df.iloc[members[c]], cell_quota[c]) for c in cells])
+        sel = [members[c][p] for c, p in zip(cells, picked)]
         print_uniformity(self.cells, keys, counts, cell_quota, n)
+        if self.plot is not None:
+            selected = np.zeros(len(keys), dtype=np.int64)
+            selected[cells] = [len(p) for p in picked]
+            stem = re.sub(r"[^\w=.-]+", "_", self.name)
+            plot_uniformity(self.cells, keys, counts, selected, Path(self.plot) / f"stratify_{stem}.png", f"Stratify {self.name}")
         return np.sort(np.concatenate(sel))
 
     def pools(self, df: pd.DataFrame) -> list[np.ndarray]:
@@ -260,7 +333,7 @@ class Partition(Sampler):
             feats = [qpos_features(env_model(), qpos_of(df.iloc[groups[k][p]]), self.weights) for k in keys for p in self.child(k).pools(df.iloc[groups[k]])]
             shared = shared_threshold(feats, n, self.seed)
             floor = self.spacing_floor * shared
-            cap = [self.child(k).capacity(df.iloc[groups[k]], floor) for k in keys]
+            cap = parallel_map(_capacity, [(self.child(k), df.iloc[groups[k]], floor) for k in keys])
             quota = allocate(quota, cap, n)
             min_dist = max(floor, min_dist or 0.0)
             print(f"Partition {self.by}: shared threshold {shared:.3f}, spacing floor {floor:.3f}")
@@ -321,10 +394,11 @@ class Chain(Sampler):
         """Split n over the values of column by, in proportion to share or equally. spacing_floor: see Partition."""
         return self._add("partition", by, share=share, spacing_floor=spacing_floor, report=tuple(report))
 
-    def stratify(self, cells: Mapping, by: str | None = None) -> "Chain":
+    def stratify(self, cells: Mapping, by: str | None = None, plot: Path | None = None) -> "Chain":
         """Uniform over the grid cells (see grid), for all rows; with by, cells is {value: grid} per value
-        of the enclosing partition on column by, the values it lacks passed through."""
-        return self._add("stratify", dict(cells), by=by)
+        of the enclosing partition on column by, the values it lacks passed through. plot: folder of
+        the distribution plot of each grid (plot_uniformity)."""
+        return self._add("stratify", dict(cells), by=by, plot=plot)
 
     def prefer(self, by: str, keep: float) -> "Chain":
         """Keep the keep share of rows lowest in column by, but never fewer than n."""
@@ -387,7 +461,10 @@ def _build(stages: tuple, values: Mapping[str, object]) -> Sampler:
             raise ValueError(f"stratify by {by!r}: no enclosing partition on {by!r}")
         else:
             cells = args[0].get(values[by])
-        return Stratify(cells, then=_build(rest, values)) if cells is not None else _build(rest, values)
+        if cells is None:
+            return _build(rest, values)
+        name = ",".join(f"{k}={v}" for k, v in values.items() if v is not None) or "all"
+        return Stratify(cells, then=_build(rest, values), plot=kwargs["plot"], name=name)
     # partition: one child per value named by share or by the per-value stages up to the next partition on by
     by = args[0]
     share = kwargs["share"]

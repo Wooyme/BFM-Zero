@@ -35,7 +35,12 @@ class MotionViewer(cmd.Cmd):
         self.history = [db]
         self.cursor = 0
         self.center = center
-        self.columns = columns or ["base_height", "base_speed", "move_angle", "torso_pitch"]
+        default_columns = (
+            ["score", "base_error_mean_deg", "joint_rmse_mean", "end_displacement"]
+            if "score" in db.metrics
+            else ["base_height", "base_speed", "move_angle", "torso_pitch"]
+        )
+        self.columns = columns or default_columns
         self.play_fps: float | None = None
         self.show_lock = threading.Lock()  # show() runs from the prompt and from the play thread
         self.model = model

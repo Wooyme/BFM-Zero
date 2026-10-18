@@ -7,7 +7,7 @@ rows with SQL through sql (DuckDB), see humanoidverse/query/motion_query.py.
 import dataclasses
 import functools
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Mapping, Sequence, Tuple
 
@@ -69,17 +69,22 @@ def compute_metrics(
     max_workers: int = 5,
     process_executor: bool = False,
     process_context: str = "spawn",
+    executor: Executor | None = None,
 ) -> Dict[str, np.ndarray]:
-    """The metrics in names of every frame, (N,) float64 each."""
+    """The metrics in names of every frame, (N,) float64 each. executor: a pool to reuse across calls
+    (max_workers then only sets how finely the frames are split), else one is made for this call."""
     unknown = [n for n in names if n not in METRICS]
     if unknown:
         raise ValueError(f"Unknown metrics {unknown}, available: {list(METRICS)}")
     if qpos.shape[0] == 0:
         return {n: np.zeros(0) for n in names}
-    chunk_size = int(np.ceil(qpos.shape[0] / max_workers))
+    # a few pieces per worker, so a slow piece does not hold the others up
+    chunk_size = int(np.ceil(qpos.shape[0] / (4 * max_workers)))
     args = [(qpos[i : i + chunk_size], qvel[i : i + chunk_size]) for i in range(0, qpos.shape[0], chunk_size)]
     f = functools.partial(_metrics_worker, model=model, names=list(names))
-    if max_workers == 1:
+    if executor is not None:
+        result = list(executor.map(f, args))
+    elif max_workers == 1:
         result = [f(a) for a in args]
     elif process_executor:
         with ProcessPoolExecutor(max_workers=max_workers, mp_context=multiprocessing.get_context(process_context)) as exe:

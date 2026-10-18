@@ -7,9 +7,13 @@ rows is the weighted pose distance. Nothing is forwarded through mujoco: the mod
 joint names and qpos addresses.
 """
 
+import atexit
 import functools
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Mapping, Sequence, Tuple
+from typing import Callable, Iterable, List, Mapping, Sequence, Tuple
 
 import mujoco
 import numpy as np
@@ -17,6 +21,50 @@ import yaml
 
 ENV_MODEL = Path(__file__).resolve().parents[3] / "data" / "robots" / "g1" / "scene_29dof_freebase_noadditional_actuators.xml"
 ROBOT_CONFIG = Path(__file__).resolve().parents[3] / "config" / "robot" / "g1" / "g1_29dof.yaml"
+
+
+_POOL: ProcessPoolExecutor | None = None
+_IN_WORKER = False
+
+
+def _init_worker():
+    global _IN_WORKER
+    _IN_WORKER = True
+
+
+def num_workers() -> int:
+    """Processes of the shared pool: MOTION_WORKERS, else every core."""
+    return int(os.environ.get("MOTION_WORKERS", os.cpu_count() or 1))
+
+
+def parallel_map(fn: Callable, items: Iterable, chunksize: int = 1) -> List:
+    """[fn(x) for x in items] on a process pool shared by the whole run (spawned once). Serial inside
+    a pool worker (no nested pools), with one worker, or for a single item."""
+    global _POOL
+    items = list(items)
+    if _IN_WORKER or num_workers() <= 1 or len(items) <= 1:
+        return [fn(x) for x in items]
+    if _POOL is None:
+        _POOL = ProcessPoolExecutor(num_workers(), mp_context=multiprocessing.get_context("spawn"), initializer=_init_worker)
+        atexit.register(_POOL.shutdown)
+    return list(_POOL.map(fn, items, chunksize=chunksize))
+
+
+def _search(ok: Callable[[float], bool], lo: float, hi: float, iters: int) -> float:
+    """Largest threshold in [lo, hi) found to pass ok (ok(lo) assumed), to (hi - lo) / 2**iters.
+
+    Serial: bisection. On the pool: each round tests num_workers() points spread over (lo, hi) at
+    once and narrows to the gap between the last passing one and the first failing one.
+    """
+    tol = (hi - lo) / 2**iters
+    p = 1 if _IN_WORKER else num_workers()
+    while hi - lo > tol:
+        points = [lo + (hi - lo) * (i + 1) / (p + 1) for i in range(p)]
+        passed = parallel_map(ok, points)
+        first_fail = next((i for i, v in enumerate(passed) if not v), p)
+        lo = points[first_fail - 1] if first_fail > 0 else lo
+        hi = points[first_fail] if first_fail < p else hi
+    return lo
 
 
 @functools.lru_cache(maxsize=None)
@@ -142,29 +190,71 @@ def symmetry_error(
     return np.linalg.norm(np.sqrt(joint_w) * err, axis=-1)
 
 
-def _greedy_net(feat: np.ndarray, order: np.ndarray, threshold: float, k: int) -> np.ndarray:
-    """Walk rows in order, keeping a row when it is >= threshold from every kept row; stop at k kept."""
-    kept = [order[0]]
-    kept_feat = np.empty((k, feat.shape[1]), dtype=feat.dtype)
-    kept_feat[0] = feat[order[0]]
-    for i in order[1:]:
-        if len(kept) == k:
+def _greedy_net(feat: np.ndarray, order: np.ndarray, threshold: float, k: int, block: int = 512, kept_block: int = 2048) -> np.ndarray:
+    """Walk rows in order, keeping a row when it is >= threshold from every kept row; stop at k kept.
+
+    Blocked, same picks as the row-by-row walk: a block of rows is first tested against the rows
+    kept before it with one matrix product (BLAS), and only its survivors are walked one by one
+    among themselves. |x - y|^2 < t^2 is tested as [x, 1] . [2y, -|y|^2] > |x|^2 - t^2, one product
+    of cache-sized tiles with no distance matrix.
+    """
+    k = min(k, len(order))
+    if k <= 0:
+        return np.zeros(0, dtype=np.int64)
+    if threshold <= 0:
+        return np.asarray(order[:k], dtype=np.int64)
+    t2 = float(threshold) ** 2
+    d = feat.shape[1]
+    kept = np.empty(k, dtype=np.int64)
+    kept_aug = np.empty((d + 1, k), dtype=np.float32)  # columns [2y, -|y|^2] of the kept rows
+    n_kept = 0
+    for start in range(0, len(order), block):
+        idx = order[start : start + block]
+        x = feat[idx].astype(np.float32)
+        x_sq = np.einsum("ij,ij->i", x, x, dtype=np.float64)
+        x_aug = np.concatenate([x, np.ones((len(x), 1), dtype=np.float32)], axis=1)
+        bound = (x_sq - t2).astype(np.float32)
+        alive = np.arange(len(idx))
+        for s in range(0, n_kept, kept_block):
+            close = (x_aug[alive] @ kept_aug[:, s : min(s + kept_block, n_kept)] > bound[alive, None]).any(axis=1)
+            alive = alive[~close]
+            if len(alive) == 0:
+                break
+        if len(alive) == 0:
+            continue
+        c = x[alive].astype(np.float64)
+        inner = x_sq[alive]
+        # close[i, j]: survivor j comes before i and is closer than the threshold; a row without
+        # one is kept, the others are decided in order (earlier rows are decided by then)
+        close = np.tril(inner[:, None] + inner[None] - 2.0 * (c @ c.T) < t2, k=-1)
+        keep = ~close.any(axis=1)
+        for i in np.flatnonzero(~keep):
+            keep[i] = not close[i, :i][keep[:i]].any()
+        rows = alive[np.flatnonzero(keep)[: k - n_kept]]
+        new = slice(n_kept, n_kept + len(rows))
+        kept[new] = idx[rows]
+        kept_aug[:d, new] = 2.0 * x[rows].T
+        kept_aug[d, new] = -x_sq[rows]
+        n_kept += len(rows)
+        if n_kept == k:
             break
-        if np.min(np.sum((kept_feat[: len(kept)] - feat[i]) ** 2, axis=-1)) >= threshold**2:
-            kept_feat[len(kept)] = feat[i]
-            kept.append(i)
-    return np.array(kept, dtype=np.int64)
+    return kept[:n_kept].copy()
+
+
+def _fills(feat: np.ndarray, order: np.ndarray, k: int, threshold: float) -> bool:
+    return len(_greedy_net(feat, order, threshold, k)) >= k
 
 
 def threshold_sample(
     feat: np.ndarray, k: int, min_dist: float | None = None, seed: int = 0, iters: int = 30
 ) -> Tuple[np.ndarray, float]:
-    """Pick up to k rows pairwise at least a threshold apart, the threshold bisected to fill k.
+    """Pick up to k rows pairwise at least a threshold apart, the threshold searched to fill k.
 
     Rows are visited in one random order and kept greedily when no kept row is closer than the
     threshold, so the picks follow the density of the rows instead of reaching for outliers. The
     threshold is the largest found that still keeps k rows, but not below min_dist (then fewer
-    than k rows are kept). Returns the picked indices and the threshold.
+    than k rows are kept); the search tests thresholds on the shared pool (_search). Returns the
+    picked indices and the threshold.
     """
     n = len(feat)
     if n == 0 or k <= 0:
@@ -177,12 +267,7 @@ def threshold_sample(
         return _greedy_net(feat, order, lo, n), lo
     # twice the farthest distance from one row bounds the diameter: keeps a single row
     hi = 2.0 * float(np.linalg.norm(feat - feat[order[0]], axis=-1).max()) + 1e-6
-    for _ in range(iters):
-        mid = 0.5 * (lo + hi)
-        if len(_greedy_net(feat, order, mid, k)) >= k:
-            lo = mid
-        else:
-            hi = mid
+    lo = _search(functools.partial(_fills, feat, order, k), lo, hi, iters)
     return _greedy_net(feat, order, lo, k), lo
 
 
@@ -194,16 +279,14 @@ def net_size(feat: np.ndarray, threshold: float, seed: int = 0) -> int:
     return len(_greedy_net(feat, order, threshold, len(feat)))
 
 
+def _keeps_total(feats: Sequence[np.ndarray], total: int, seed: int, threshold: float) -> bool:
+    return sum(net_size(f, threshold, seed) for f in feats) >= total
+
+
 def shared_threshold(feats: Sequence[np.ndarray], total: int, seed: int = 0, iters: int = 30) -> float:
     """Largest threshold at which thinning every feature set at that one threshold keeps total rows in all."""
     feats = [f for f in feats if len(f)]
     if sum(len(f) for f in feats) <= total:
         return 0.0
-    lo, hi = 0.0, 2.0 * max(float(np.linalg.norm(f - f[0], axis=-1).max()) for f in feats) + 1e-6
-    for _ in range(iters):
-        mid = 0.5 * (lo + hi)
-        if sum(net_size(f, mid, seed) for f in feats) >= total:
-            lo = mid
-        else:
-            hi = mid
-    return lo
+    hi = 2.0 * max(float(np.linalg.norm(f - f[0], axis=-1).max()) for f in feats) + 1e-6
+    return _search(functools.partial(_keeps_total, feats, total, seed), 0.0, hi, iters)

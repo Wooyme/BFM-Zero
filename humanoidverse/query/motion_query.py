@@ -28,9 +28,12 @@ sample(n) continues the chain with the samplers of motion_sampling.
 This is a library: the queries themselves are scripts in scripts/queries.
 """
 
+from concurrent.futures import ProcessPoolExecutor
 import dataclasses
 from fnmatch import fnmatch
 import json
+import multiprocessing
+import os
 from pathlib import Path
 import tempfile
 import time
@@ -229,7 +232,7 @@ class Query:
     chunk: int = 100_000
     max_frames: int | None = None
     stride: int = 1
-    max_workers: int = 12
+    max_workers: int = os.cpu_count() or 1
 
     def _then(self, op) -> "Query":
         return dataclasses.replace(self, ops=self.ops + (op,))
@@ -317,20 +320,30 @@ class Query:
             chunk = max(1, chunk // frames.lead[1]) * frames.lead[1]
         print(f"Scanning {stop} of {frames.num_frames} frames")
         start_t = time.time()
+        # one pool for all chunks: spawning a worker re-imports the package
+        pool = ProcessPoolExecutor(self.max_workers, mp_context=multiprocessing.get_context("spawn")) if self.max_workers > 1 else None
+        try:
+            parts = self._scan_chunks(frames, names, ops, stop, chunk, pool)
+        finally:
+            if pool is not None:
+                pool.shutdown()
+        df = pd.concat(parts, ignore_index=True)
+        print(f"{len(df)} frames (done in {time.time() - start_t:.0f}s)")
+        return df
+
+    def _scan_chunks(self, frames, names: list, ops: tuple, stop: int, chunk: int, pool) -> list:
         parts = []
         for start in range(0, stop, chunk):
             end = min(start + chunk, stop)
             qpos = frames.read(f"{frames.prefix}qpos", start, end)[:: self.stride]
             qvel = frames.read(f"{frames.prefix}qvel", start, end)[:: self.stride]
-            metrics = compute_metrics(env_model(), qpos, qvel, names, max_workers=self.max_workers, process_executor=self.max_workers > 1)
+            metrics = compute_metrics(env_model(), qpos, qvel, names, max_workers=self.max_workers, executor=pool)
             df = frame_table(start, self.stride, qpos, metrics)
             for op in ops:  # conditions see the metrics in float64, kept rows store them in float32
                 df = op(df)
             parts.append(df.astype({n: np.float32 for n in names}))
             print(f"  frames [{start}, {end}): {len(df)} match")
-        df = pd.concat(parts, ignore_index=True)
-        print(f"{len(df)} frames (done in {time.time() - start_t:.0f}s)")
-        return df
+        return parts
 
 
 def _literal(value: str | None) -> str:
@@ -370,7 +383,7 @@ class Source:
         chunk: frames read from the source per step.
         max_frames: only scan the first max_frames frames.
         stride: only scan every stride-th frame.
-        max_workers: processes computing the metrics.
+        max_workers: processes computing the metrics (default: every core).
     """
 
     model_folder: Path
@@ -380,7 +393,7 @@ class Source:
     chunk: int = 100_000
     max_frames: int | None = None
     stride: int = 1
-    max_workers: int = 12
+    max_workers: int = os.cpu_count() or 1
     device: str = "cuda"
 
     def open(self):

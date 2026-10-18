@@ -142,6 +142,67 @@ Rendering uses MuJoCo, MediaPy, and FFmpeg. The default OpenGL backend is `egl` 
 (or the existing `MUJOCO_GL` environment variable); `--backend osmesa` supports software rendering when
 OSMesa is installed, and `--backend glfw` uses a display. `--list` does not initialize OpenGL.
 
+### Rank initial poses using BFM holding
+
+```bash
+# Evaluate every original LAFAN frame using Isaac Sim (3,072 parallel environments).
+uv run python -m humanoidverse.pose_hold_eval
+
+# A small inspection run with an explicit GPU batch size.
+uv run python -m humanoidverse.pose_hold_eval --num-envs 128 \
+    --stride 100 --max-frames 128 -o data/pose_hold/preview
+
+# Resume interrupted work with the same inputs, model, code and scoring config.
+uv run python -m humanoidverse.pose_hold_eval --resume
+```
+
+Every original frame is evaluated, including airborne, low and lying poses. Defaults use
+`new_model_for_training_code_inference`, the trusted pickles in
+`humanoidverse/data/lafan_29dof`, and a 5-second closed-loop rollout. `--model-folder`, `--data-path`,
+`--motion NAME` (repeatable), `--stride`, and `--max-frames` select the model and inputs. Original
+frame indices and FPS are retained; targets are not resampled to the policy frequency.
+
+Initialization preserves the base orientation and 29 joint angles, centers XY, and shifts Z until
+Isaac Sim's collision geometry is 1 cm above the fixed floor (`--clearance 0.01`). All
+velocities and past actions are zero. History repeats the stationary initial observation, and
+kinematics are refreshed without advancing physics. The initial observation, including its aligned
+root height, gives one fixed `goal_inference` latent. The deterministic actor controls the robot
+throughout the rollout using the saved training configuration's scaling, hard-waist gains, limits
+and armature. Noise, randomization, motion-reference tasks and automatic resets are absent.
+
+The policy loader keeps only actor, backward and observation-normalizer weights. Isaac Sim runs
+headless GPU physics with `--num-envs 3072` by default, the configuration validated on the current
+RTX 5070. Set `--num-envs` explicitly to fit another GPU. The backend and parallel count remain fixed
+throughout a ranking run. `--device cuda:0` selects the GPU.
+
+At 50 Hz, each rollout compares its full base quaternion (including yaw, invariant to quaternion
+sign) and 29 joints to the fixed initial target. For `A(x) = 0.7 mean(x²) + 0.3 P95(x²)`, the default
+cost is `0.4 A(base_angle / 15°) + 0.4 A(joint_RMSE / 0.2 rad) + 0.2 (end_distance / 0.25 m)²`.
+The score is `100 exp(-cost)`; ranking uses cost to avoid underflow ties. Scores include initial
+landing and all subsequent motion, without an unscored settling period. All weights and scales are
+CLI options; `--base-scale` takes radians. Independent base/joint/pose/distance ranks are also kept.
+Maximum displacement, path length and final-second speeds expose continuous or returning movement.
+
+Output in `data/pose_hold/lafan_29dof/`:
+
+- `ranking.csv`: every initial frame, source name/index, mean/P95/max errors, displacements, scores
+  and ranks. `valid` means a numerically completed rollout, not a stability certificate; finite falls
+  still contribute their full error. Numerical failures have score zero and rank after valid samples.
+- `motion_db.pkl`: ranked **initial frames**, zero initial `qvel`, original unshifted `qpos_original`,
+  metrics and source labels, directly browsable with the existing viewer.
+- `parts/batch_*.npz`: completed batches of scalar summaries, initial poses and per-frame latents;
+  used for resume. No trajectories or per-time-step score arrays are saved.
+- `manifest.json`, `summary.json`: provenance, completion statistics and measured throughput.
+  Model/configuration/physics/code fingerprints prevent incompatible resumes.
+
+```bash
+uv run python -m humanoidverse.motion_viewer --db data/pose_hold/lafan_29dof/motion_db.pkl
+```
+
+For example, `columns score base_error_mean_deg joint_rmse_mean end_displacement` changes the overlay;
+`where end_displacement < 0.1 AND joint_rmse_p95 < 0.15` narrows the ranked view. Input motions are
+unchanged. Existing results require `--resume` or explicit `--overwrite`.
+
 
 ## Training
 
