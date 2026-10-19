@@ -203,6 +203,71 @@ For example, `columns score base_error_mean_deg joint_rmse_mean end_displacement
 `where end_displacement < 0.1 AND joint_rmse_p95 < 0.15` narrows the ranked view. Input motions are
 unchanged. Existing results require `--resume` or explicit `--overwrite`.
 
+### Extract and browse self-stable motion sequences
+
+Build sequence candidates from the original LAFAN motions and their pose-hold ranking, without
+loading a checkpoint or starting Isaac Sim:
+
+```bash
+uv run python -m humanoidverse.motion_sequence.build
+```
+
+Defaults are `--data-path humanoidverse/data/lafan_29dof`,
+`--ranking data/pose_hold/lafan_29dof/ranking.csv`, `--threshold 83`, and
+`--output-dir data/motion_sequence/lafan_29dof`. Existing outputs require `--overwrite`.
+Every source frame must have exactly one finite score. Duplicate/missing scores, invalid frame
+indices, unknown sources/motions, and source hashes differing from the ranking's sibling
+`manifest.json` cause extraction to fail.
+
+A frame is stable exactly when **`score > threshold`** (83 itself is unstable at the default).
+Frames are restored to temporal order within each `(source_file, motion_name)` before extraction:
+
+- `stable`: each maximal continuous stable run, including isolated stable frames.
+- `transition`: the last stable frame before an unstable run, all unstable frames in that run,
+  and the first subsequent stable frame. Unstable prefixes/tails without both stable endpoints
+  do not form transitions.
+
+Endpoints can be shared. For `S S U U S S`, the result is stable `[0,1]`, transition `[1,4]`,
+and stable `[4,5]`. Segments never cross source motions, and there is no length limit or score smoothing.
+
+The output directory contains:
+
+- `sequence_db.pkl`: a versioned Joblib index containing source references/hashes, chronological
+  per-frame score snapshots, and sequence records. It does not duplicate the original motions.
+- `sequences.csv`: ID, kind, relative source filename, motion name, inclusive start/end frame,
+  FPS, endpoint/minimum/mean scores, frame count, and duration in seconds.
+- `summary.json`: provenance, sequence counts/length statistics and unclosed unstable frame counts.
+
+IDs are zero-based and deterministic in source filename, motion name, then start-frame order;
+stable segments precede transitions with the same start. Frame count is `end-start+1`;
+duration is `(end-start)/fps`, so a single-frame segment has zero elapsed duration.
+The public Python API is `SequenceDatabase.load(path)`, `.sequences`, and
+`.get_frames(sequence_id)`, returning `(qpos, scores)` with both endpoints included and WXYZ root
+quaternions. Only load trusted pickle files. Keep the original motion files available; the viewer
+loads them on demand and checks their hashes against the index.
+
+```bash
+uv run python -m humanoidverse.motion_sequence.viewer
+# Or select another index:
+uv run python -m humanoidverse.motion_sequence.viewer --db /path/to/sequence_db.pkl
+```
+
+The MuJoCo window shows original reference poses with sequence/source coordinates, score and
+stability status. Playback starts paused, follows the root with the camera, and uses the source FPS.
+Centering subtracts only the segment's **starting** XY, preserving translation within the segment;
+use `--no-center` to keep the original world coordinates. This is kinematic pose playback.
+
+| Command | Behavior |
+| --- | --- |
+| `head [n]`, `info` | List the next n sequences (default 20), or inspect the selected sequence. |
+| `seq <id>`, `next`, `prev` | Select a sequence and pause at its first frame; next/prev wrap. |
+| `show <i>` or `<i>` | Jump to a local zero-based frame within the sequence. |
+| `n [k]`, `p [k]`, empty line | Step forward/backward locally, wrapping within the sequence. |
+| `play [speed]`, `stop` | Play at source FPS times speed (default 1), or pause. Singletons stay paused. |
+| `loop on\|off` | Repeat the current sequence (default on), or pause at its last frame. |
+| `center on\|off` | Toggle the translation of the segment's start to XY zero. |
+| `quit`, Ctrl-D | Stop playback, close the window and exit. |
+
 
 ## Training
 
