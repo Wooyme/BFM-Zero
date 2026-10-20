@@ -531,6 +531,32 @@ uv run python scripts/queries/walk_vocab.py --model-folder /path/to/model --late
 
 Velocities follow the walking command: `base_vx` / `base_vy` are in m/s in the heading frame, and `yaw_rate` is in rad/s.
 
+### Latent residual VQ
+
+`humanoidverse.latent_vq` tokenizes the goal latent of every LAFAN frame into two tokens, after the action tokenizer of VQ-BeT: an MLP encoder, a 2-layer residual VQ (the first code is coarse, the second quantizes what it left) and an MLP decoder whose output is projected onto the z sphere like `project_z`. Codebooks are EMA updated with k-means initialization and dead-code replacement; the loss is L1 reconstruction + 5 × commitment.
+
+```bash
+# z = project_z(B(next_obs)) per frame, velocities kept (velocity_multiplier 1); needs Isaac
+uv run python -m humanoidverse.latent_vq.extract --model-folder /path/to/model
+# 4 motions held out for validation; --all trains on every motion
+uv run python -m humanoidverse.latent_vq.train --model-folder /path/to/model \
+    --chunk 8 --codebook-size 256 --hidden-dim 1024 --layer-num 2
+```
+
+With `--chunk T`, one token pair encodes T consecutive z of one motion (the action chunks of VQ-BeT). Training takes a window at every frame; tokenizing takes back-to-back windows, the last of each motion ending on its last frame.
+
+Training prints L1, cosine of z_hat to z (mean, 5th percentile, and from the first token alone), codes used and perplexity per layer, and unique token pairs, on the train and held-out motions. At the end it reports, on the held-out motions, the cosine of a flat k-means with `codebook_size²` centers (the same token budget, capped at 4096).
+
+**Outputs** (under `model_folder/latent_vq/`): `goal_z.npz` (`z`, `qpos`, `qvel`, `motion`, `motion_time` of every frame); `<run>/rvq.pt` (`LatentRVQVAE.load`, then `encode(z)` of `(N, T, z_dim)` windows → `(N, 2)` tokens and `decode(tokens)` → windows), `<run>/tokens.npz` (`tokens` and first frame `starts` of each window, `chunk`, and per frame `z_hat`, `motion`, `motion_time`, `is_val`) and `<run>/metrics.json`.
+
+### Experiments
+
+One-off experiments live in `experiments/` (run from the repository root as `python -m experiments.<name>`), each with a write-up under `experiments/docs/<name>/`: setup, raw results, inferences, takeaways and common misreadings.
+
+| Experiment | Question | Write-up |
+|---|---|---|
+| `tracking_window` | How the tracking window T = 1..8 changes z and what the actor does with it | [experiments/docs/tracking_window](experiments/docs/tracking_window/README.md) |
+
 ---
 
 

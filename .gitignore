@@ -5,3 +5,4 @@
 /motivo_isaac.egg-info/
 /model/checkpoint/model/
 *.pyc
+/experiments/docs/**/*.npz
