@@ -155,20 +155,30 @@ class PolicyExporterLSTM(torch.nn.Module):
 
 
 def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, velocity_multiplier: float = 1.0) -> torch.Tensor:
-    from humanoidverse.utils.torch_utils import quat_rotate_inverse
-    from humanoidverse.envs.legged_robot_motions.legged_robot_motions import compute_humanoid_observations_max, compute_humanoid_observations_max_with_contact
-    
     motion_times = torch.arange(int(np.ceil((env._motion_lib._motion_lengths[motion_id]/env.dt).cpu()))).to(env.device) * env.dt
     
     # get blend motion state
     motion_state = env._motion_lib.get_motion_state(motion_id, motion_times)
+    return backward_observation_from_state(
+        env,
+        motion_state["rg_pos_t"],
+        motion_state["rg_rot_t"],
+        motion_state["body_vel_t"] * velocity_multiplier,
+        motion_state["body_ang_vel_t"] * velocity_multiplier,
+        motion_state["dof_pos"],
+        motion_state["dof_vel"] * velocity_multiplier,
+        use_root_height_obs=use_root_height_obs,
+    )
 
-    ref_body_pos = motion_state["rg_pos_t"]
-    ref_body_rots = motion_state["rg_rot_t"]
-    ref_body_vels = motion_state["body_vel_t"] * velocity_multiplier
-    ref_body_angular_vels = motion_state["body_ang_vel_t"] * velocity_multiplier
-    ref_dof_pos = motion_state["dof_pos"] - env.default_dof_pos[0]
-    ref_dof_vel = motion_state["dof_vel"] * velocity_multiplier
+
+def backward_observation_from_state(env, ref_body_pos, ref_body_rots, ref_body_vels, ref_body_angular_vels, dof_pos, ref_dof_vel,
+                                    use_root_height_obs: bool = False):
+    """Backward-map observation of reference states: body positions, rotations (xyzw), velocities and angular velocities
+    (N, bodies incl. extended, ...) and absolute joint positions and velocities (N, dofs)."""
+    from humanoidverse.utils.torch_utils import quat_rotate_inverse
+    from humanoidverse.envs.legged_robot_motions.legged_robot_motions import compute_humanoid_observations_max, compute_humanoid_observations_max_with_contact
+
+    ref_dof_pos = dof_pos - env.default_dof_pos[0]
 
     # construct observation
     if env.use_contact_in_obs_max:
@@ -209,7 +219,7 @@ def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, 
             "ref_ang_vel": ref_ang_vel,
             "ref_dof_pos": ref_dof_pos,
             "ref_dof_vel": ref_dof_vel,
-            "dof_pos": motion_state["dof_pos"],
+            "dof_pos": dof_pos,
             "fake_history": bogus_history_actor,
             "max_local_self_obs": max_local_self_obs,
             "projected_gravity": projected_gravity,

@@ -556,6 +556,12 @@ One-off experiments live in `experiments/` (run from the repository root as `pyt
 | Experiment | Question | Write-up |
 |---|---|---|
 | `tracking_window` | How the tracking window T = 1..8 changes z and what the actor does with it | [experiments/docs/tracking_window](experiments/docs/tracking_window/README.md) |
+| `motion_to_z` | How differences between reference motion frames show up in the goal z, and how often a close z hides a far motion | [experiments/docs/motion_to_z](experiments/docs/motion_to_z/README.md) |
+| `z_to_motion` | How a controlled change of z (cosine, direction) changes the actions and trajectories of the policy | [experiments/docs/z_to_motion](experiments/docs/z_to_motion/README.md) |
+| `dof_noise_z` | How noise on N upper-body, lower-body or arbitrary joints of a reference frame changes its goal z | [experiments/docs/dof_noise_z](experiments/docs/dof_noise_z/README.md) |
+| `rvq_capacity` | How closely residual VQ reproduces the goal z, at what token budget, on training and unseen motions | [experiments/docs/rvq_capacity](experiments/docs/rvq_capacity/README.md) |
+| `rvq_rollout` | How well the policy still tracks motions when z is replaced by its residual VQ reconstruction | [experiments/docs/rvq_rollout](experiments/docs/rvq_rollout/README.md) |
+| `hand_compose` | Whether walking plus a hand target can come from two additive latent tables, z = project(z_walk + λ z_hand), instead of one product vocab | [experiments/docs/hand_compose](experiments/docs/hand_compose/README.md) |
 
 ---
 

@@ -51,6 +51,21 @@ def rollout_starts(lengths: list[int], horizon: int, stride: int) -> tuple[np.nd
     return np.concatenate(motion), np.concatenate(frame)
 
 
+def behavior_gaps(acts, body, body_ref, dof, dof_ref) -> dict[str, torch.Tensor]:
+    """Per-step gaps of shape (starts, variants) from the actions (S, V, A), bodies (S, V, nb, 3) and joints (S, V, nd);
+    *_base compare with variant 0 of each start, *_ref with the reference."""
+    local, local_ref = body - body[:, :, :1], body_ref - body_ref[:, :, :1]
+    return {
+        "action_base": (acts - acts[:, :1]).norm(dim=-1),
+        "dof_base": (dof - dof[:, :1]).square().mean(-1).sqrt(),
+        "root_xy_base": (body[:, :, 0, :2] - body[:, :1, 0, :2]).norm(dim=-1),
+        "body_base": (body - body[:, :1]).norm(dim=-1).mean(-1),
+        "body_ref": (body - body_ref).norm(dim=-1).mean(-1),
+        "body_ref_local": (local - local_ref).norm(dim=-1).mean(-1),
+        "dof_ref": (dof - dof_ref).square().mean(-1).sqrt(),
+    }
+
+
 def category(name: str) -> str:
     """Motion category from a LAFAN name, e.g. dance1_subject1 -> dance."""
     return re.match(r"[A-Za-z]+", name).group(0)
@@ -92,6 +107,21 @@ class Reference:
         return torch.cat([self.body_pos[rows, 0], rot, self.root_vel[rows], self.root_ang_vel[rows]], dim=-1)
 
 
+def reset_to_reference(wrapped_env, ref: Reference, env_rows: torch.Tensor):
+    """Reset every env to the reference state of its row (root and joints) and return the observation after one
+    zero-action step, as humanoidverse/tracking_inference.py does."""
+    env = wrapped_env._env
+    num_envs = env.num_envs
+    dof_states = torch.stack([ref.dof_pos[env_rows], ref.dof_vel[env_rows]], dim=-1)
+    target_states = {"dof_states": dof_states, "root_states": ref.root_states(env_rows, wxyz=env.config.simulator.config.name == "isaacsim")}
+    env.reset_envs_idx(torch.arange(num_envs, dtype=torch.long, device=env.device), target_states=target_states)
+    zero = torch.zeros((num_envs, wrapped_env.action_space.shape[-1]), dtype=torch.float32, device=env.device)
+    wrapped_env.step(zero, to_numpy=False)
+    if not torch.allclose(env.simulator.dof_pos, ref.dof_pos[env_rows], atol=1e-4):
+        raise RuntimeError("Reset did not reach the reference joint positions")
+    return wrapped_env._get_g1env_observation(to_numpy=False)
+
+
 def build_env(model_folder: Path, motion_dir: str, num_envs: int):
     from humanoidverse.agents.envs.humanoidverse_isaac import HumanoidVerseIsaacConfig
 
@@ -121,15 +151,7 @@ def run_batch(wrapped_env, model, ref: Reference, windows: list[int], rows: torc
     env_window = torch.as_tensor(windows, device=env.device).repeat(n)
     env_window = torch.cat([env_window, env_window[:1].repeat(num_envs - n * W)])
 
-    dof_states = torch.stack([ref.dof_pos[env_rows], ref.dof_vel[env_rows]], dim=-1)
-    target_states = {"dof_states": dof_states, "root_states": ref.root_states(env_rows, wxyz=env.config.simulator.config.name == "isaacsim")}
-    env_ids = torch.arange(num_envs, dtype=torch.long, device=env.device)
-    env.reset_envs_idx(env_ids, target_states=target_states)
-    zero = torch.zeros((num_envs, wrapped_env.action_space.shape[-1]), dtype=torch.float32, device=env.device)
-    wrapped_env.step(zero, to_numpy=False)
-    observation = wrapped_env._get_g1env_observation(to_numpy=False)
-    if not torch.allclose(env.simulator.dof_pos, ref.dof_pos[env_rows], atol=1e-4):
-        raise RuntimeError("Reset did not reach the reference joint positions")
+    observation = reset_to_reference(wrapped_env, ref, env_rows)
 
     def latents(k: int) -> torch.Tensor:
         frame = torch.minimum(env_rows + 1 + k, env_ends - 1)
@@ -157,18 +179,10 @@ def run_batch(wrapped_env, model, ref: Reference, windows: list[int], rows: torc
         if (terminated | truncated).any():
             raise RuntimeError("An env was reset during the rollout; terminations must be off")
         target = torch.minimum(env_rows + 1 + k, env_ends - 1)
-        body = per_start(env.simulator._rigid_body_pos - origins[:, None])
-        body_ref = per_start(ref.body_pos[target])
-        dof, dof_ref = per_start(env.simulator.dof_pos), per_start(ref.dof_pos[target])
-        acts = per_start(action)
-        out["action_base"][:, :, k] = (acts - acts[:, :1]).norm(dim=-1)
-        out["dof_base"][:, :, k] = (dof - dof[:, :1]).square().mean(-1).sqrt()
-        out["root_xy_base"][:, :, k] = (body[:, :, 0, :2] - body[:, :1, 0, :2]).norm(dim=-1)
-        out["body_base"][:, :, k] = (body - body[:, :1]).norm(dim=-1).mean(-1)
-        out["body_ref"][:, :, k] = (body - body_ref).norm(dim=-1).mean(-1)
-        local, local_ref = body - body[:, :, :1], body_ref - body_ref[:, :, :1]
-        out["body_ref_local"][:, :, k] = (local - local_ref).norm(dim=-1).mean(-1)
-        out["dof_ref"][:, :, k] = (dof - dof_ref).square().mean(-1).sqrt()
+        gaps = behavior_gaps(per_start(action), per_start(env.simulator._rigid_body_pos - origins[:, None]),
+                             per_start(ref.body_pos[target]), per_start(env.simulator.dof_pos), per_start(ref.dof_pos[target]))
+        for name, v in gaps.items():
+            out[name][:, :, k] = v
     out = {k: v.cpu().numpy() for k, v in out.items()}
     # all windows of a start act first from the same state: the network's own output gap
     out["open_loop_action"] = out["action_base"][:, :, 0]
