@@ -11,7 +11,8 @@ over their per-frame metrics (METRICS in envs/g1_env_helper/queries/metrics.py).
     )
 
 Conditions and expressions are DuckDB SQL over the columns of the table: frame (index in the
-source), every metric and qpos_0 .. qpos_<nq-1>. When a query is easier to read as one statement,
+source), origin (where the frame comes from, "<file>:<frame index>"), every metric and
+qpos_0 .. qpos_<nq-1>. When a query is easier to read as one statement,
 write it raw, inline or from a .sql file, with $name parameters:
 
     Source(model_folder).scan().sql('''
@@ -24,6 +25,11 @@ The leading row-local operations (where, case, with_columns given SQL expression
 per_chunk) run while scanning, chunk by chunk, so the buffer is never held whole; the others
 (order_by, limit, sql, Python column functions, sample) run on the rows that pass them.
 sample(n) continues the chain with the samplers of motion_sampling.
+
+Static stability (the pose_hold score of a pose, query/stability.py) is a column like the others,
+only evaluated in Isaac Sim when not cached, so put it after the cheap conditions:
+
+    Source(model_folder).scan().where("base_speed <= 0.1").stable(90).to_database()
 
 This is a library: the queries themselves are scripts in scripts/queries.
 """
@@ -64,6 +70,7 @@ class H5Frames:
 
     def __init__(self, path: Path):
         self.file = h5py.File(path, "r")
+        self.name = _display_path(path)
         self.prefix = "next-" if "next-qpos" in self.file else ""
         qpos = self.file[f"{self.prefix}qpos"]
         self.lead = qpos.shape[:-1]
@@ -99,13 +106,18 @@ class H5Frames:
         frames["next_obs"] = {k.split("-")[-1]: self.gather(k, idx) for k in self.obs_keys}
         return frames
 
+    def origins(self, idx: np.ndarray) -> np.ndarray:
+        """"<buffer.hdf5>:<frame>" of frames idx."""
+        return np.char.add(f"{self.name}:", np.asarray(idx).astype(str))
+
 
 class LafanFrames:
     """Frames of LAFAN motions sampled at the env dt by the motion library of an Isaac env.
 
     Same interface as H5Frames (a flat (N, ...) source): qpos / qvel for the query, and the
     backward observations of get_backward_observation (velocity_multiplier 1) as next_obs, so
-    goal inference sees the same inputs as for frames of the replay buffer.
+    goal inference sees the same inputs as for frames of the replay buffer. motion_frame is the
+    frame of the motion file nearest to each sample, as pose_hold's frame_index counts them.
     """
 
     prefix = ""
@@ -121,7 +133,7 @@ class LafanFrames:
         env_config["hydra_overrides"] += ["env.config.max_episode_length_s=10000", "env.config.headless=True", "simulator=isaacsim"]
         env_config["disable_domain_randomization"] = True
         env_config["disable_obs_noise"] = True
-        data = {"qpos": [], "qvel": [], "motion": [], "motion_time": []}
+        data = {"qpos": [], "qvel": [], "motion": [], "motion_time": [], "motion_frame": []}
         next_obs = []
         # the motion library loads files lazily by index, so they must outlive the loop
         with tempfile.TemporaryDirectory() as motion_dir:
@@ -146,6 +158,7 @@ class LafanFrames:
                 data["qvel"].append(qvel.cpu().numpy())
                 data["motion"].append(np.full(n, name))
                 data["motion_time"].append(times.cpu().numpy())
+                data["motion_frame"].append(torch.round(times * lib._motion_fps[0]).long().cpu().numpy())
                 next_obs.append({k: v.cpu().numpy() for k, v in obs.items()})
                 print(f"  {name}: {n} frames")
         self.data = {k: np.concatenate(v) for k, v in data.items()}
@@ -162,6 +175,10 @@ class LafanFrames:
         frames["next_obs"] = {k: v[idx] for k, v in self.next_obs.items()}
         return frames
 
+    def origins(self, idx: np.ndarray) -> np.ndarray:
+        """"<motion>:<motion_frame>" of frames idx."""
+        return np.char.add(np.char.add(self.data["motion"][idx].astype(str), ":"), self.data["motion_frame"][idx].astype(str))
+
 
 def lafan_files(lafan_dir: Path, patterns: str) -> list[Path]:
     """Motion files of lafan_dir whose name matches one of the comma-separated glob patterns."""
@@ -172,9 +189,15 @@ def lafan_files(lafan_dir: Path, patterns: str) -> list[Path]:
     return files
 
 
-def frame_table(start: int, stride: int, qpos: np.ndarray, metrics: dict) -> pd.DataFrame:
-    """Rows of consecutive frames start, start + stride, ...: frame, metrics and qpos_<i>."""
-    df = pd.DataFrame({"frame": start + np.arange(len(qpos), dtype=np.int64) * stride, **metrics})
+def _display_path(path: Path) -> str:
+    """path relative to the repository when inside it."""
+    path = Path(path).resolve()
+    return str(path.relative_to(HUMANOIDVERSE_DIR.parent)) if path.is_relative_to(HUMANOIDVERSE_DIR.parent) else str(path)
+
+
+def frame_table(start: int, stride: int, qpos: np.ndarray, metrics: dict, origin: np.ndarray) -> pd.DataFrame:
+    """Rows of consecutive frames start, start + stride, ...: frame, origin, metrics and qpos_<i>."""
+    df = pd.DataFrame({"frame": start + np.arange(len(qpos), dtype=np.int64) * stride, "origin": origin, **metrics})
     return pd.concat([df, pd.DataFrame(qpos.astype(np.float32), columns=qpos_columns(qpos.shape[1]))], axis=1)
 
 
@@ -217,6 +240,27 @@ class ColumnOp:
 
     def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
         return df.assign(**{self.name: np.asarray(self.fn(df))})
+
+
+@dataclasses.dataclass(frozen=True)
+class StabilityOp:
+    """Add columns of the pose_hold scores of the rows' qpos ({name: cache column}), from the stability cache."""
+
+    columns: tuple  # (name, cache column) pairs
+    cache: object  # StabilityCache, opened on first use
+    row_local: bool = False
+
+    def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
+        from humanoidverse.envs.g1_env_helper.bench.motion_metrics import qpos_of
+        from humanoidverse.query.stability import StabilityCache
+
+        if df.empty:
+            return df.assign(**{name: np.empty(0, dtype=np.float32) for name, _ in self.columns})
+        if "origin" not in df.columns:
+            raise ValueError("Stability needs the origin column of the frame table")
+        cache = self.cache() if self.cache is StabilityCache else self.cache
+        scores = cache.scores(qpos_of(df), df["origin"].to_numpy().astype(str), tuple(column for _, column in self.columns))
+        return df.assign(**{name: scores[column].to_numpy().astype(np.float32) for name, column in self.columns})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -264,7 +308,7 @@ class Query:
 
     def sql(self, statement: str | Path, per_chunk: bool = False, **bindings) -> "Query":
         """A raw DuckDB statement over the table `frames` (the rows reaching it), e.g. a whole query
-        with CTEs, CASE, windows and joins. It must keep the frame and qpos_<i> columns (SELECT *).
+        with CTEs, CASE, windows and joins. It must keep the frame, origin and qpos_<i> columns (SELECT *).
 
         statement: the SQL, or the Path of a .sql file holding it.
         per_chunk: the statement looks at one row at a time (no ORDER BY, LIMIT, DISTINCT, GROUP BY,
@@ -278,6 +322,24 @@ class Query:
         tables = tuple((k, v) for k, v in bindings.items() if isinstance(v, pd.DataFrame))
         params = tuple((k, v) for k, v in bindings.items() if not isinstance(v, pd.DataFrame))
         return self._then(SqlOp(statement, row_local=per_chunk, params=params, tables=tables))
+
+    def with_stability(self, columns: Mapping[str, str] | None = None, cache=None) -> "Query":
+        """Add the static stability of each row: the pose_hold score (0..100) of the BFM policy holding
+        its pose from rest, read from the stability cache, the poses not cached yet evaluated in Isaac
+        Sim batches and added to it. Not row-local, so it runs on the rows that reach it.
+
+        columns: {name: cache column} (columns of query.stability.SCORE_COLUMNS, e.g. base_score,
+            joint_score, distance_score), default {"stability": "score"}.
+        cache: a StabilityCache (another model, evaluation settings or batch size), default its defaults.
+        """
+        from humanoidverse.query.stability import StabilityCache
+
+        columns = columns or {"stability": "score"}
+        return self._then(StabilityOp(tuple(columns.items()), cache or StabilityCache))
+
+    def stable(self, min_score: float, cache=None) -> "Query":
+        """Keep the rows whose static stability (column stability, see with_stability) is >= min_score."""
+        return self.with_stability(cache=cache).where("stability >= $min_score", min_score=float(min_score))
 
     def sample(self, n: int):
         """Continue with samplers that pick n rows: .sample(n).partition(...).stratify(...).prefer(...).spread(...)."""
@@ -301,7 +363,7 @@ class Query:
         """The collected rows as a MotionDatabase, with their frame data gathered from the source.
 
         Numeric columns become metrics; text columns (e.g. bucket) become the code of each value in
-        its sorted values, kept in labels.
+        its sorted values, kept in labels. origin is left out: source_index identifies the frame.
         """
         if isinstance(self.frames, pd.DataFrame):
             raise ValueError("A query over a table keeps no frame data, use collect")
@@ -338,7 +400,7 @@ class Query:
             qpos = frames.read(f"{frames.prefix}qpos", start, end)[:: self.stride]
             qvel = frames.read(f"{frames.prefix}qvel", start, end)[:: self.stride]
             metrics = compute_metrics(env_model(), qpos, qvel, names, max_workers=self.max_workers, executor=pool)
-            df = frame_table(start, self.stride, qpos, metrics)
+            df = frame_table(start, self.stride, qpos, metrics, frames.origins(np.arange(start, end)[:: self.stride]))
             for op in ops:  # conditions see the metrics in float64, kept rows store them in float32
                 df = op(df)
             parts.append(df.astype({n: np.float32 for n in names}))
@@ -359,7 +421,7 @@ def to_database(frames, df: pd.DataFrame) -> MotionDatabase:
     kept = {k: ({kk: vv[inverse] for kk, vv in v.items()} if isinstance(v, dict) else v[inverse]) for k, v in kept.items()}
     metrics, labels = {}, {}
     for c in df.columns:
-        if c == "frame" or c.startswith(QPOS_PREFIX):
+        if c in ("frame", "origin") or c.startswith(QPOS_PREFIX):
             continue
         if pd.api.types.is_numeric_dtype(df[c]) or pd.api.types.is_bool_dtype(df[c]):
             metrics[c] = df[c].to_numpy().astype(np.float32)

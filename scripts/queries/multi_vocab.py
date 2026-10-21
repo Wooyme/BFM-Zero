@@ -33,7 +33,7 @@ SIMILARITY = {
 # Upright frames walk / turn / stand; posture frames are static, from squat down to lying (torso_tilt
 # is unsigned, about 90 lying prone or supine; above 90 the head is below the hips).
 UPRIGHT = "base_height BETWEEN 0.55 AND 1.0 AND torso_tilt <= 30"
-POSTURE = "base_height < 0.55"
+POSTURE = "base_height < 0.8"
 
 # Translation tiers are square rings of cmd_speed = max(|vx|, |vy|), since vx and vy are sampled
 # independently; bucket names sort in token order. Posture is checked first (the first matching bucket
@@ -51,10 +51,11 @@ def vocab(query: Query, total: int = 4000, plot: Path | None = None):
         query
         # upright or a static low posture, a foot on the ground (lower ankle_roll_link within 0.05 m
         # of its height with the sole flat), wrists below shoulders, inside the command range
-        .where(f"foot_clearance <= 0.05 AND (({UPRIGHT}) OR ({POSTURE}))")
+        .where(f"(({UPRIGHT}) OR ({POSTURE}))")
         .where("greatest(left_wrist_above_shoulder, right_wrist_above_shoulder) <= 0")
         .where("abs(base_vx) <= 1.05 AND abs(base_vy) <= 1.05 AND abs(yaw_rate) <= 1.5")
         .with_columns(cmd_speed="greatest(abs(base_vx), abs(base_vy))")
+        .with_stability({"d_score": "distance_score"})
         .case("bucket", BUCKETS)  # first matching bucket wins
         .where("bucket IS NOT NULL")
         .case("grp",
@@ -101,12 +102,12 @@ def zero_velocity(db: MotionDatabase, bucket: str = "10_posture"):
     rows = np.flatnonzero(db.metrics["bucket"] == db.labels["bucket"].index(bucket))
     obs = db.frames["next_obs"]
     ndof = db.frames["qvel"].shape[-1] - 6
-    obs["state"][rows, ndof : 2 * ndof] = 0
-    obs["state"][rows, 2 * ndof + 3 :] = 0
+    obs["state"][rows, ndof: 2 * ndof] = 0
+    obs["state"][rows, 2 * ndof + 3:] = 0
     width = obs["privileged_state"].shape[-1]
     nb = (width + 3) // 15  # 15 * nb - 3, plus 1 with root_height
     assert width in (15 * nb - 3, 15 * nb - 2), f"unexpected privileged_state width {width}"
-    obs["privileged_state"][rows, width - 6 * nb :] = 0
+    obs["privileged_state"][rows, width - 6 * nb:] = 0
 
 
 def main(source: Source, total: int = 4096, latent: bool = False, output: Path | None = None):

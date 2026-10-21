@@ -1,38 +1,8 @@
 [
   {
     "frames": [
-      33
+      2166
     ],
-    "motion_name": "halfkneeling"
-  },
-  {
-    "frames": [
-      298
-    ],
-    "motion_name": "doggy1"
-  },
-  {
-    "frames": [
-      296
-    ],
-    "motion_name": "ridding1"
-  },
-  {
-    "frames": [
-      2
-    ],
-    "motion_name": "doggy0"
-  },
-  {
-    "frames": [
-      3773
-    ],
-    "motion_name": "fallAndGetUp1_subject4"
-  },
-  {
-    "frames": [
-      296
-    ],
-    "motion_name": "ridding1_prepare"
+    "motion_name": "rec_20261021_132122"
   }
 ]

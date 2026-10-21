@@ -6,3 +6,4 @@
 /model/checkpoint/model/
 *.pyc
 /experiments/docs/**/*.npz
+/.cache/
