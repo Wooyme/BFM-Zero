@@ -1,6 +1,6 @@
 """Export stable pose_hold frames as one holosoma motion of static goal poses with their BFM-Zero goal latents.
 
-Frames are those of humanoidverse/pose_hold_eval.py output (parts/*.npz) that are valid with score > min_score:
+Frames are those of humanoidverse/pose_hold/eval.py output (parts/*.npz) that are valid with score > min_score:
 the frozen actor, given z = goal_inference of the stationary frame, held the pose. Each frame becomes one row of a
 holosoma MotionLoader npz (fps, joint/body names, joint_pos [xyz, wxyz, joints], zero joint_vel, body_pos_w,
 body_quat_w (wxyz), zero body velocities) from the motion library's forward kinematics of initial_qpos, and z_track

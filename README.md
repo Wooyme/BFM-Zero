@@ -146,14 +146,14 @@ OSMesa is installed, and `--backend glfw` uses a display. `--list` does not init
 
 ```bash
 # Evaluate every original LAFAN frame using Isaac Sim (3,072 parallel environments).
-uv run python -m humanoidverse.pose_hold_eval
+uv run python -m humanoidverse.pose_hold.eval
 
 # A small inspection run with an explicit GPU batch size.
-uv run python -m humanoidverse.pose_hold_eval --num-envs 128 \
+uv run python -m humanoidverse.pose_hold.eval --num-envs 128 \
     --stride 100 --max-frames 128 -o data/pose_hold/preview
 
 # Resume interrupted work with the same inputs, model, code and scoring config.
-uv run python -m humanoidverse.pose_hold_eval --resume
+uv run python -m humanoidverse.pose_hold.eval --resume
 ```
 
 Every original frame is evaluated, including airborne, low and lying poses. Defaults use
@@ -182,6 +182,16 @@ The score is `100 exp(-cost)`; ranking uses cost to avoid underflow ties. Scores
 landing and all subsequent motion, without an unscored settling period. All weights and scales are
 CLI options; `--base-scale` takes radians. Independent base/joint/pose/distance ranks are also kept.
 Maximum displacement, path length and final-second speeds expose continuous or returning movement.
+
+This `score` (also `fidelity_score`) measures how faithfully the pose is **reproduced**. A separate
+`stability_score` measures how stable the **base** is, independent of the target: how much pelvis height, XY
+position, yaw and tilt (the gravity direction in the base frame, against its mean) change from their own medians
+over the rollout. Its cost is `0.25 A(Δheight / 0.1 m) + 0.25 A(ΔXY / 0.25 m) + 0.25 A(Δyaw / 15°) + 0.25 A(Δtilt / 15°)`,
+with per-term `height/drift/yaw/tilt_score` and the maxima `height_dev_max`, `drift_dev_max`, `yaw_dev_max_deg`,
+`tilt_dev_max_deg`. A pose held steadily in another posture is stable but not faithful; a fall is neither.
+What is actually held is described by medians over the rollout: `hold_height` (pelvis height, m) and
+`torso_tilt_deg` (angle of the torso_link z axis to world up).
+Code is in the `humanoidverse/pose_hold/` package (`scores.py` holds the scores).
 
 Output in `data/pose_hold/lafan_29dof/`:
 
@@ -562,6 +572,7 @@ One-off experiments live in `experiments/` (run from the repository root as `pyt
 | `rvq_capacity` | How closely residual VQ reproduces the goal z, at what token budget, on training and unseen motions | [experiments/docs/rvq_capacity](experiments/docs/rvq_capacity/README.md) |
 | `rvq_rollout` | How well the policy still tracks motions when z is replaced by its residual VQ reconstruction | [experiments/docs/rvq_rollout](experiments/docs/rvq_rollout/README.md) |
 | `hand_compose` | Whether walking plus a hand target can come from two additive latent tables, z = project(z_walk + λ z_hand), instead of one product vocab | [experiments/docs/hand_compose](experiments/docs/hand_compose/README.md) |
+| `stable_wrist` | Whether z = project(B(stable pose) + w B(right wrist frame)), as reward_inference, makes the policy hold the pose and reach the wrist position from the default pose | [experiments/docs/stable_wrist](experiments/docs/stable_wrist/README.md) |
 
 ---
 

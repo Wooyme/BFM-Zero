@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,16 +8,10 @@ import joblib
 import numpy as np
 import torch
 
-from humanoidverse.pose_hold import (
-    DEFAULT_MODEL,
-    Observations,
-    ScoreConfig,
-    Scores,
-    control_parameters,
-    load_training_config,
-    transform_actions,
-)
-from humanoidverse.pose_hold_eval import load_catalog, parser, rank_values, run
+from humanoidverse.pose_hold import cache
+from humanoidverse.pose_hold.eval import load_catalog, parser, rank_values, run
+from humanoidverse.pose_hold.policy import DEFAULT_MODEL, Observations, control_parameters, load_training_config, transform_actions
+from humanoidverse.pose_hold.scores import ScoreConfig, Scores
 
 
 def poses(n=2):
@@ -76,6 +71,68 @@ class ScoreTests(unittest.TestCase):
         np.testing.assert_array_equal(rank_values(np.array([1, 1, 0.1]), np.array([True, True, False]), np.array([2, 1, 0])), [2, 1, 3])
         with self.assertRaises(ValueError):
             ScoreConfig(base_weight=0.8)
+        with self.assertRaises(ValueError):
+            ScoreConfig(height_weight=0.5)
+
+    def test_stability_is_separate_from_fidelity(self):
+        # held steadily in another posture: unfaithful, perfectly stable
+        target = poses(1)
+        q = target.clone()
+        q[0, 7:] = 0.3
+        q[0, 3:7] = torch.tensor([np.cos(np.deg2rad(10)), np.sin(np.deg2rad(10)), 0, 0])
+        result = score_constant(target, q)
+        self.assertLess(result["fidelity_score"][0], 50)
+        self.assertAlmostEqual(result["stability_score"][0], 100, places=4)
+        self.assertEqual(result["fidelity_score"][0], result["score"][0])
+
+        def rollout(pose):
+            s = Scores(target, 10, 0.1)
+            for i in range(10):
+                s.add(i, {"qpos": pose(i, target.clone()), "qvel": torch.zeros(1, 35)}, [True])
+            return s.finish()
+
+        def fall(i, q):
+            q[0, 2] -= 0.3 if i >= 5 else 0
+            return q
+
+        result = rollout(fall)
+        self.assertAlmostEqual(result["height_dev_max"][0], 0.3, places=5)
+        self.assertLess(result["height_score"][0], 1)
+        self.assertLess(result["stability_score"][0], 50)
+        self.assertAlmostEqual(result["fidelity_score"][0], 100 * np.exp(-0.2 * (0.3 / 0.25) ** 2), places=3)  # only end distance
+
+        def spin(i, q):
+            yaw = np.deg2rad(40 * i)  # past ±180°: unwrapped
+            q[0, 3:7] = torch.tensor([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)])
+            return q
+
+        result = rollout(spin)
+        self.assertAlmostEqual(result["yaw_dev_max_deg"][0], 200, places=3)
+        self.assertLess(result["yaw_score"][0], 1)
+        self.assertAlmostEqual(result["tilt_score"][0], 100, places=4)
+
+        def wobble(i, q):
+            roll = np.deg2rad(15 if i % 2 else -15)
+            q[0, 3:7] = torch.tensor([np.cos(roll / 2), np.sin(roll / 2), 0, 0])
+            return q
+
+        # held posture: median pelvis height and torso tilt (torso pitched 30° for most of the rollout)
+        s = Scores(target, 10, 0.1, torso=1)
+        for i in range(10):
+            q = target.clone()
+            q[0, 2] = 0.6 if i else 0.8
+            pitch = np.deg2rad(30 if i else 0)
+            rot = torch.tensor([[[0, 0, 0, 1], [0, np.sin(pitch / 2), 0, np.cos(pitch / 2)]]], dtype=torch.float32)
+            s.add(i, {"qpos": q, "qvel": torch.zeros(1, 35), "body_rot": rot}, [True])
+        result = s.finish()
+        self.assertAlmostEqual(result["hold_height"][0], 0.6, places=6)
+        self.assertAlmostEqual(result["torso_tilt_deg"][0], 30, places=3)
+        self.assertTrue(np.isnan(score_constant(target, target)["torso_tilt_deg"][0]))
+
+        result = rollout(wobble)
+        self.assertAlmostEqual(result["tilt_dev_max_deg"][0], 15, places=3)
+        self.assertLess(result["tilt_score"][0], 50)
+        self.assertAlmostEqual(result["yaw_score"][0], 100, places=4)
 
 
 def stationary_state(qpos):
@@ -164,7 +221,7 @@ class ObservationExportTests(unittest.TestCase):
         for key in initial:
             torch.testing.assert_close(initial[key], reset[key])
 
-    @patch("humanoidverse.pose_hold_eval.make_backend", side_effect=StationaryBackend)
+    @patch("humanoidverse.pose_hold.eval.make_backend", side_effect=StationaryBackend)
     def test_resume_initial_only_outputs(self, make_backend):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -200,7 +257,7 @@ class ObservationExportTests(unittest.TestCase):
                 self.assertEqual(cache["latent"].shape, (2, 256))
                 self.assertTrue(all(cache[k].ndim <= 2 for k in cache))
             args.resume = True
-            with patch("humanoidverse.pose_hold_eval.evaluate_batch", side_effect=AssertionError("Recomputed cached batch")):
+            with patch("humanoidverse.pose_hold.eval.evaluate_batch", side_effect=AssertionError("Recomputed cached batch")):
                 run(args)
             self.assertEqual(part.stat().st_mtime_ns, timestamp)
             from humanoidverse.envs.g1_env_helper.bench.motion_metrics import MotionDatabase
@@ -232,6 +289,29 @@ class CatalogTests(unittest.TestCase):
             np.testing.assert_array_equal(catalog["source_index"], [0, 2, 4, 5, 7])
             np.testing.assert_array_equal(catalog["frame_index"], [0, 2, 4, 0, 2])
             np.testing.assert_allclose(catalog["time"], [0, 2 / 30, 4 / 30, 0, 2 / 30])
+
+
+class CacheTests(unittest.TestCase):
+    def test_old_cache_gains_new_columns_and_named_inserts(self):
+        old = ("score", "base_score", "joint_score", "pose_score", "distance_score", "cost", "valid",
+               "base_error_mean_deg", "base_error_max_deg", "joint_rmse_mean", "joint_error_max",
+               "end_displacement", "max_displacement", "tail_base_speed", "height_shift")  # fmt: skip
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.sqlite"
+            con = sqlite3.connect(path)
+            con.execute(f"CREATE TABLE scores (config TEXT NOT NULL, key INTEGER NOT NULL, {', '.join(c + ' REAL' for c in old)}, "
+                        "origin TEXT, PRIMARY KEY (config, key)) WITHOUT ROWID")
+            con.close()
+            con = cache.connect(path)
+            columns = [row[1] for row in con.execute("PRAGMA table_info(scores)")]
+            self.assertTrue(set(cache.SCORE_COLUMNS) <= set(columns))
+            self.assertNotEqual(columns[2 : 2 + len(cache.SCORE_COLUMNS)], list(cache.SCORE_COLUMNS))
+            values = [float(i) for i in range(len(cache.SCORE_COLUMNS))]
+            with con:
+                con.execute("INSERT OR REPLACE " + cache.INSERT, ("c", 1, *values, "x:0", 1))
+            row = con.execute(f"SELECT {', '.join(cache.SCORE_COLUMNS)} FROM scores").fetchone()
+            con.close()
+            self.assertEqual(list(row), values)
 
 
 if __name__ == "__main__":

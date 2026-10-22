@@ -26,8 +26,8 @@ per_chunk) run while scanning, chunk by chunk, so the buffer is never held whole
 (order_by, limit, sql, Python column functions, sample) run on the rows that pass them.
 sample(n) continues the chain with the samplers of motion_sampling.
 
-Static stability (the pose_hold score of a pose, query/stability.py) is a column like the others,
-only evaluated in Isaac Sim when not cached, so put it after the cheap conditions:
+Static stability and fidelity (the pose_hold scores of a pose, pose_hold/cache.py) are columns like the
+others, only evaluated in Isaac Sim when not cached, so put them after the cheap conditions:
 
     Source(model_folder).scan().where("base_speed <= 0.1").stable(90).to_database()
 
@@ -252,7 +252,7 @@ class StabilityOp:
 
     def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
         from humanoidverse.envs.g1_env_helper.bench.motion_metrics import qpos_of
-        from humanoidverse.query.stability import StabilityCache
+        from humanoidverse.pose_hold.cache import StabilityCache
 
         if df.empty:
             return df.assign(**{name: np.empty(0, dtype=np.float32) for name, _ in self.columns})
@@ -324,22 +324,27 @@ class Query:
         return self._then(SqlOp(statement, row_local=per_chunk, params=params, tables=tables))
 
     def with_stability(self, columns: Mapping[str, str] | None = None, cache=None) -> "Query":
-        """Add the static stability of each row: the pose_hold score (0..100) of the BFM policy holding
-        its pose from rest, read from the stability cache, the poses not cached yet evaluated in Isaac
-        Sim batches and added to it. Not row-local, so it runs on the rows that reach it.
+        """Add the pose_hold scores (0..100) of the BFM policy holding each row's pose from rest: by default
+        fidelity (fidelity_score, how closely it reproduces the pose) and stability (stability_score, how
+        little the base moves, falls or turns), read from the stability cache, the poses not cached yet
+        evaluated in Isaac Sim batches and added to it. Not row-local, so it runs on the rows that reach it.
 
-        columns: {name: cache column} (columns of query.stability.SCORE_COLUMNS, e.g. base_score,
-            joint_score, distance_score), default {"stability": "score"}.
+        columns: {name: cache column} (columns of pose_hold.cache.SCORE_COLUMNS, e.g. score, base_score,
+            joint_score, distance_score, height_score), default {"fidelity": "fidelity_score", "stability": "stability_score"}.
         cache: a StabilityCache (another model, evaluation settings or batch size), default its defaults.
         """
-        from humanoidverse.query.stability import StabilityCache
+        from humanoidverse.pose_hold.cache import StabilityCache
 
-        columns = columns or {"stability": "score"}
+        columns = columns or {"fidelity": "fidelity_score", "stability": "stability_score"}
         return self._then(StabilityOp(tuple(columns.items()), cache or StabilityCache))
 
-    def stable(self, min_score: float, cache=None) -> "Query":
-        """Keep the rows whose static stability (column stability, see with_stability) is >= min_score."""
-        return self.with_stability(cache=cache).where("stability >= $min_score", min_score=float(min_score))
+    def stable(self, min_score: float, min_fidelity: float | None = None, cache=None) -> "Query":
+        """Keep the rows whose base stability (column stability, see with_stability) is >= min_score and,
+        if given, whose fidelity (column fidelity) is >= min_fidelity."""
+        query = self.with_stability(cache=cache).where("stability >= $min_score", min_score=float(min_score))
+        if min_fidelity is not None:
+            query = query.where("fidelity >= $min_fidelity", min_fidelity=float(min_fidelity))
+        return query
 
     def sample(self, n: int):
         """Continue with samplers that pick n rows: .sample(n).partition(...).stratify(...).prefer(...).spread(...)."""
@@ -429,6 +434,25 @@ def to_database(frames, df: pd.DataFrame) -> MotionDatabase:
             labels[c] = sorted(df[c].dropna().unique())
             metrics[c] = pd.Categorical(df[c], categories=labels[c]).codes.astype(np.float32)
     return MotionDatabase(metrics=metrics, source_index=idx, frames=kept, labels=labels)
+
+
+def zero_velocity(db: MotionDatabase, rows: np.ndarray | None = None) -> None:
+    """Zero the velocities in the next_obs of rows of db (default: all), in place, as goal_inference does
+    (get_backward_observation with velocity_multiplier 0): a static posture is a goal without motion.
+
+    state is [dof_pos, dof_vel, projected_gravity, base_ang_vel] (dof_vel and base_ang_vel zeroed);
+    privileged_state is [root_height?, local_body_pos (3 * (nb - 1)), local_body_rot (6 * nb),
+    local_body_vel (3 * nb), local_body_ang_vel (3 * nb)] (the last 6 * nb zeroed).
+    """
+    rows = slice(None) if rows is None else rows
+    obs = db.frames["next_obs"]
+    ndof = db.frames["qvel"].shape[-1] - 6
+    obs["state"][rows, ndof: 2 * ndof] = 0
+    obs["state"][rows, 2 * ndof + 3:] = 0
+    width = obs["privileged_state"].shape[-1]
+    nb = (width + 3) // 15  # 15 * nb - 3, plus 1 with root_height
+    assert width in (15 * nb - 3, 15 * nb - 2), f"unexpected privileged_state width {width}"
+    obs["privileged_state"][rows, width - 6 * nb:] = 0
 
 
 @dataclasses.dataclass

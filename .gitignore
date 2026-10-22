@@ -6,4 +6,5 @@
 /model/checkpoint/model/
 *.pyc
 /experiments/docs/**/*.npz
+/experiments/docs/**/*.pkl
 /.cache/

@@ -74,6 +74,22 @@ class HeightAbove(Metric):
 
 
 @dataclasses.dataclass(frozen=True)
+class BodyOffset(Metric):
+    """Position of a body origin relative to the pelvis in the heading frame along axis (0 forward, 1 left,
+    2 up), as local_body_pos of the privileged observation."""
+
+    body: str
+    axis: int
+
+    def __call__(self, model, data):
+        R = get_xmat(model, data, "pelvis")
+        yaw = np.arctan2(R[1, 0], R[0, 0])  # heading of the pelvis x axis, as calc_heading_quat
+        c, s = np.cos(yaw), np.sin(yaw)
+        x, y, z = get_xpos(model, data, self.body) - get_xpos(model, data, "pelvis")
+        return float((c * x + s * y, -s * x + c * y, z)[self.axis])
+
+
+@dataclasses.dataclass(frozen=True)
 class FootClearance(Metric):
     """Height of the lower ankle_roll_link above ground_ankle_height, its height with the sole flat on the ground."""
 
@@ -194,4 +210,8 @@ METRICS: Dict[str, Metric] = {
     "foot_clearance": FootClearance(0.035),
     "left_wrist_above_shoulder": HeightAbove("left_wrist_roll_link", "left_shoulder_pitch_link"),
     "right_wrist_above_shoulder": HeightAbove("right_wrist_roll_link", "right_shoulder_pitch_link"),
+    # right wrist relative to the pelvis, heading frame
+    "right_wrist_x": BodyOffset("right_wrist_yaw_link", 0),
+    "right_wrist_y": BodyOffset("right_wrist_yaw_link", 1),
+    "right_wrist_z": BodyOffset("right_wrist_yaw_link", 2),
 }

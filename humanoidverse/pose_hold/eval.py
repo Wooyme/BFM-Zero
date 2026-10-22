@@ -1,6 +1,6 @@
 """Rank original motion frames by deterministic BFM closed-loop pose holding.
 
-Run: python -m humanoidverse.pose_hold_eval --help
+Run: python -m humanoidverse.pose_hold.eval --help
 Only initial poses and per-goal summaries are saved; rollouts are never recorded.
 """
 
@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from humanoidverse.pose_hold import (
+from humanoidverse.pose_hold.policy import (
     DEFAULT_DATA,
     DEFAULT_MODEL,
     DEFAULT_OUTPUT,
@@ -28,11 +28,10 @@ from humanoidverse.pose_hold import (
     VIEWER_MJCF,
     GoalPolicy,
     Observations,
-    ScoreConfig,
-    Scores,
     load_training_config,
     sha256,
 )
+from humanoidverse.pose_hold.scores import SCORE_NAMES, ScoreConfig, Scores
 
 
 def atomic_json(path, value):
@@ -99,7 +98,7 @@ def load_catalog(source, stride=1, max_frames=None, motions=None):
 
 
 def make_backend(config, batch_size, clearance, device):
-    from humanoidverse.pose_hold_isaac import IsaacBackend
+    from humanoidverse.pose_hold.isaac import IsaacBackend
 
     return IsaacBackend(config, batch_size=batch_size, clearance=clearance, device=device)
 
@@ -123,7 +122,7 @@ def evaluate_batch(backend, policy, observations, qpos, duration, score_config):
             raise RuntimeError(f"Checkpoint observation contract mismatch: {key}")
     z = policy.goal_inference(obs)
     steps = math.ceil(duration / backend.dt)
-    scoring = Scores(initial, steps, backend.dt, score_config)
+    scoring = Scores(initial, steps, backend.dt, score_config, torso=observations.body_names.index("torso_link"))
     for step in range(steps):
         action = policy.act(obs, z, mean=True)
         state, applied = backend.step(action)
@@ -148,7 +147,7 @@ def rank_values(values, valid, source):
 def publish(output, catalog, result, manifest, elapsed):
     from humanoidverse.envs.g1_env_helper.bench.motion_metrics import MotionDatabase
 
-    for name in ("base", "joint", "pose", "distance", ""):
+    for name in SCORE_NAMES:
         prefix = name + "_" if name else ""
         result[prefix + "rank"] = rank_values(result[prefix + "cost"], result["valid"], catalog["source_index"])
     order = np.argsort(result["rank"])
@@ -195,6 +194,7 @@ def publish(output, catalog, result, manifest, elapsed):
         "total_evaluation_seconds": float(result["evaluation_seconds"].sum()),
         "timing_scope": "Wall time is this invocation; evaluation seconds include completed cached batches.",
         "score_quantiles": np.quantile(result["score"], [0, 0.25, 0.5, 0.75, 0.95, 1]).tolist(),
+        "stability_score_quantiles": np.quantile(result["stability_score"], [0, 0.25, 0.5, 0.75, 0.95, 1]).tolist(),
         "viewer_mjcf": str(VIEWER_MJCF),
         "outputs": ["ranking.csv", "motion_db.pkl", "summary.json", "parts/*.npz"],
     }
@@ -238,7 +238,7 @@ def run(args):
             "checkpoint/model/model.safetensors",
         )
     ]
-    code_files = [Path(__file__).parent / name for name in ("pose_hold.py", "pose_hold_eval.py", "pose_hold_isaac.py")]
+    code_files = [Path(__file__).parent / name for name in ("policy.py", "scores.py", "isaac.py", "eval.py")]
     asset = ROOT / config["robot"]["asset"]["asset_root"] / config["robot"]["asset"]["usd_file"]
     physics_files = sorted(asset.parent.rglob("*.usd"))
     identity = {
@@ -281,6 +281,8 @@ def run(args):
         "configuration": config,
         "torch": torch.__version__,
         "score_formula": "100*exp(-(base_weight*Q+joint_weight*J+distance_weight*D)); A=mean_weight*mean(x²)+(1-mean_weight)*p95(x²)",
+        "stability_score_formula": "100*exp(-(height_weight*A(h-median h)+drift_weight*A(|xy-median xy|)+yaw_weight*A(yaw-median yaw)"
+        "+tilt_weight*A(angle(gravity, mean gravity)))), each over its scale",
         "initial_history": "repeat current stationary observation; past actions zero; no warmup physics steps",
     }
     if args.resume and exists and saved["backend"] != manifest["backend"]:

@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 
-from humanoidverse.pose_hold import ROOT, control_parameters, transform_actions
+from humanoidverse.pose_hold.policy import ROOT, control_parameters, transform_actions
 from humanoidverse.utils.torch_utils import quat_rotate_inverse
 
 

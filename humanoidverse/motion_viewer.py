@@ -36,7 +36,7 @@ class MotionViewer(cmd.Cmd):
         self.cursor = 0
         self.center = center
         default_columns = (
-            ["score", "base_error_mean_deg", "joint_rmse_mean", "end_displacement"]
+            ["score", "stability_score", "base_error_mean_deg", "joint_rmse_mean", "end_displacement"]
             if "score" in db.metrics
             else ["base_height", "base_speed", "move_angle", "torso_pitch"]
         )

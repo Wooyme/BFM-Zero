@@ -1,4 +1,4 @@
-"""Policy-only G1 pose holding: checkpoint observations and bounded-memory scores.
+"""Policy-only G1 pose holding: checkpoint policy and observations.
 
 No static feasibility filtering is performed. All quaternions at the public qpos
 boundary are WXYZ; body quaternions inside observation construction are XYZW.
@@ -6,8 +6,6 @@ boundary are WXYZ; body quaternions inside observation construction are XYZW.
 
 import hashlib
 import json
-import math
-from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +25,7 @@ from humanoidverse.utils.torch_utils import (
     quat_to_tan_norm,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = ROOT / "new_model_for_training_code_inference"
 DEFAULT_DATA = ROOT / "humanoidverse/data/lafan_29dof"
 DEFAULT_OUTPUT = ROOT / "data/pose_hold/lafan_29dof"
@@ -212,99 +210,3 @@ class Observations:
             for k in self.history:
                 self.history[k] = torch.cat([parts[k][:, None], self.history[k][:, :-1]], dim=1)
         return observation, s
-
-
-@dataclass(frozen=True)
-class ScoreConfig:
-    base_scale: float = math.radians(15)
-    joint_scale: float = 0.2
-    distance_scale: float = 0.25
-    base_weight: float = 0.4
-    joint_weight: float = 0.4
-    distance_weight: float = 0.2
-    mean_weight: float = 0.7
-
-    def __post_init__(self):
-        values = asdict(self)
-        if not all(math.isfinite(v) and v >= 0 for v in values.values()):
-            raise ValueError("Score parameters must be finite and nonnegative")
-        if min(self.base_scale, self.joint_scale, self.distance_scale) <= 0 or not 0 <= self.mean_weight <= 1:
-            raise ValueError("Invalid score scales or mean_weight")
-        if not math.isclose(self.base_weight + self.joint_weight + self.distance_weight, 1):
-            raise ValueError("Score weights must sum to one")
-
-
-class Scores:
-    def __init__(self, initial, steps, dt, config=ScoreConfig()):
-        self.initial, self.steps, self.dt, self.config = initial.clone(), steps, dt, config
-        n = len(initial)
-        self.angles = torch.empty((steps, n), device=initial.device)
-        self.joints = torch.empty_like(self.angles)
-        self.previous = initial[:, :3].clone()
-        self.path = torch.zeros(n, device=initial.device)
-        self.max_displacement = torch.zeros_like(self.path)
-        self.max_joint = torch.zeros_like(self.path)
-        self.tail = torch.zeros((3, n), device=initial.device)
-        self.tail_count = 0
-        self.valid = torch.ones(n, dtype=torch.bool, device=initial.device)
-
-    def add(self, step, state, valid):
-        q, v = state["qpos"], state["qvel"]
-        self.valid &= torch.as_tensor(valid, dtype=torch.bool, device=q.device) & torch.isfinite(q).all(-1) & torch.isfinite(v).all(-1)
-        self.valid &= torch.linalg.vector_norm(q[:, 3:7], dim=-1) > 1e-8
-        quat = torch.nn.functional.normalize(q[:, 3:7], dim=-1)
-        target = torch.nn.functional.normalize(self.initial[:, 3:7], dim=-1)
-        # Equivalent SO(3) geodesic, using the chord formula for accuracy near
-        # zero. In particular identical q and -q yield exactly zero error.
-        sign = torch.where((quat * target).sum(-1, keepdim=True) < 0, -1.0, 1.0)
-        chord = torch.linalg.vector_norm(quat - sign * target, dim=-1)
-        self.angles[step] = 4 * torch.asin((chord / 2).clamp(0, 1))
-        errors = q[:, 7:] - self.initial[:, 7:]
-        self.joints[step] = errors.square().mean(-1).sqrt()
-        self.max_joint = torch.maximum(self.max_joint, errors.abs().amax(-1))
-        self.path += torch.linalg.vector_norm(q[:, :3] - self.previous, dim=-1)
-        self.previous = q[:, :3].clone()
-        self.max_displacement = torch.maximum(self.max_displacement, torch.linalg.vector_norm(q[:, :3] - self.initial[:, :3], dim=-1))
-        if (step + 1) * self.dt > self.steps * self.dt - min(1.0, self.steps * self.dt) + 1e-8:
-            self.tail += torch.stack(
-                (torch.linalg.vector_norm(v[:, :3], dim=-1), torch.linalg.vector_norm(v[:, 3:6], dim=-1), v[:, 6:].square().mean(-1).sqrt())
-            )
-            self.tail_count += 1
-
-    def finish(self):
-        cfg = self.config
-        delta = self.previous - self.initial[:, :3]
-        displacement = torch.linalg.vector_norm(delta, dim=-1)
-
-        def cost(errors, scale):
-            x = (errors / scale).square()
-            return cfg.mean_weight * x.mean(0) + (1 - cfg.mean_weight) * torch.quantile(x, 0.95, dim=0)
-
-        b, j, d = cost(self.angles, cfg.base_scale), cost(self.joints, cfg.joint_scale), (displacement / cfg.distance_scale).square()
-        total = cfg.base_weight * b + cfg.joint_weight * j + cfg.distance_weight * d
-        result = {
-            "base_error_mean_deg": torch.rad2deg(self.angles.mean(0)),
-            "base_error_p95_deg": torch.rad2deg(torch.quantile(self.angles, 0.95, dim=0)),
-            "base_error_max_deg": torch.rad2deg(self.angles.amax(0)),
-            "joint_rmse_mean": self.joints.mean(0),
-            "joint_rmse_p95": torch.quantile(self.joints, 0.95, dim=0),
-            "joint_rmse_max": self.joints.amax(0),
-            "joint_error_max": self.max_joint,
-            "end_displacement": displacement,
-            "end_displacement_xy": torch.linalg.vector_norm(delta[:, :2], dim=-1),
-            "max_displacement": self.max_displacement,
-            "path_length": self.path,
-            "tail_base_speed": self.tail[0] / max(1, self.tail_count),
-            "tail_base_angular_speed": self.tail[1] / max(1, self.tail_count),
-            "tail_joint_speed": self.tail[2] / max(1, self.tail_count),
-            "base_cost": b,
-            "joint_cost": j,
-            "pose_cost": (b + j) / 2,
-            "distance_cost": d,
-            "cost": total,
-        }
-        result["valid"] = self.valid & torch.isfinite(total)
-        for key in ("base", "joint", "pose", "distance", ""):
-            name = key + "_" if key else ""
-            result[name + "score"] = torch.where(result["valid"], 100 * torch.exp(-result[name + "cost"]), 0)
-        return {k: v.detach().cpu().numpy() for k, v in result.items()}

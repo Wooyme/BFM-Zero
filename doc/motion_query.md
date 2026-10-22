@@ -50,8 +50,9 @@ db.save(model_folder / "motion_query" / "motion_db.pkl")
 | 手臂关节 | `left/right_elbow_flexion`, `left/right_arm_abduction` | deg；flexion 为 0 表示伸直，abduction 外展为正 |
 | 部位高度 | `torso_height`, `left/right_hand_height`, `left/right_knee_height`, `left/right_foot_height` | m（世界 z） |
 | 接触与相对高度 | `foot_clearance`, `left/right_wrist_above_shoulder` | m；foot_clearance 是较低一侧脚踝离脚掌平放时高度的距离 |
+| 右手腕相对骨盆 | `right_wrist_x`, `right_wrist_y`, `right_wrist_z` | m；`right_wrist_yaw_link` 相对骨盆，heading 坐标系（只去 yaw，x 前 y 左 z 上），同 privileged_state 的 local_body_pos |
 | 姿态原始值 | `qpos_0` .. `qpos_35` | 根位置 0-2、根四元数 wxyz 3-6、关节角 7-35 |
-| 静态稳定性 | `stability` 等（仅在调用 `with_stability` / `stable` 之后才有） | 0-100 分 |
+| 静态稳定性 | `fidelity`, `stability` 等（仅在调用 `with_stability` / `stable` 之后才有） | 0-100 分 |
 
 要新增指标，在 `envs/g1_env_helper/queries/metrics.py` 的 `METRICS` 中注册一个 `Metric` 实例。
 
@@ -79,16 +80,25 @@ db.save(model_folder / "motion_query" / "motion_db.pkl")
 
 ## 静态稳定性
 
-静态稳定性指 BFM 策略从静止状态保持一个姿态 5 秒后得到的 pose_hold score（0-100），和 `data/pose_hold/lafan_29dof/ranking.csv` 中的 `score` 是同一个量。实现在 `humanoidverse/query/stability.py`。
+BFM 策略从静止状态保持一个姿态 5 秒，得到两个相互独立的 pose_hold 分数（0-100）：
+
+- **复现分数** `fidelity_score`：和原姿态比，基座朝向、关节、终点位移差多少。它和 `data/pose_hold/lafan_29dof/ranking.csv` 中的 `score` 是同一个量。
+- **基座稳定分数** `stability_score`：不看原姿态，只看整个仿真过程中骨盆高度、XY 位置、yaw、倾斜（重力方向）相对各自中位数变化了多少。数值基本不变就是稳定。一个姿态如果被稳稳保持在另一个形状上，它稳定但复现差；摔倒则两者都差。
+
+实现在 `humanoidverse/pose_hold/`（`scores.py` 计算分数，`cache.py` 管缓存）。
 
 ```python
-q.stable(90)                                         # 只保留 score >= 90 的行
-q.with_stability()                                   # 只加 stability 列
-q.with_stability({"stability": "score", "base": "base_score", "dist": "distance_score"})
+q.stable(90)                                         # 只保留 stability_score >= 90 的行
+q.stable(90, min_fidelity=85)                        # 同时要求 fidelity_score >= 85
+q.with_stability()                                   # 加 fidelity 和 stability 两列
+q.with_stability({"stability": "stability_score", "fall": "height_score", "dist": "distance_score"})
 q.stable(90, cache=StabilityCache(num_envs=1024))    # 换模型 / batch 大小 / 评估参数
 ```
 
-可取的缓存列：`score`, `base_score`, `joint_score`, `pose_score`, `distance_score`, `cost`, `valid`, `base_error_mean_deg`, `base_error_max_deg`, `joint_rmse_mean`, `joint_error_max`, `end_displacement`, `max_displacement`, `tail_base_speed`, `height_shift`。
+可取的缓存列：
+- 复现：`score`（= `fidelity_score`）, `base_score`, `joint_score`, `pose_score`, `distance_score`, `cost`, `valid`, `base_error_mean_deg`, `base_error_max_deg`, `joint_rmse_mean`, `joint_error_max`, `end_displacement`, `max_displacement`, `tail_base_speed`, `height_shift`
+- 稳定：`stability_score`, `height_score`, `drift_score`, `yaw_score`, `tilt_score`, `height_dev_max`, `drift_dev_max`, `yaw_dev_max_deg`, `tilt_dev_max_deg`
+- 实际保持住的姿态（整个仿真过程的中位数）：`hold_height`（骨盆高度，m），`torso_tilt_deg`（torso_link 的 z 轴和竖直向上的夹角，度）
 
 **缓存。** 分数存在 `.cache/pose_hold.sqlite`。第一次使用时会自动导入 pose_hold 的 ranking.csv（约 26.5 万个姿态，耗时约 9 秒）；ranking.csv 更新后会重新导入。
 
@@ -99,8 +109,8 @@ q.stable(90, cache=StabilityCache(num_envs=1024))    # 换模型 / batch 大小 
 **补算。** 到达这一步的行里，没有缓存的姿态会先去重，再交给一个 Isaac Sim 子进程，按 `num_envs`（默认 3072）批量仿真。每批跑完就写入缓存，中断后已完成的进度不会丢。启动开销约 25 秒，之后的耗时取决于批数。用子进程的原因是：LAFAN 数据源已经在查询进程里启动了一个 Isaac app，而一个进程只能有一个。
 
 ```bash
-uv run python -m humanoidverse.query.stability import [--ranking PATH] [--force]
-uv run python -m humanoidverse.query.stability stats
+uv run python -m humanoidverse.pose_hold.cache import [--ranking PATH] [--force]
+uv run python -m humanoidverse.pose_hold.cache stats
 ```
 
 ## 采样
@@ -145,6 +155,7 @@ query.sample(4000)
 8. **先 `prefer` 再 `spread`。** `spread` 要在候选池上反复二分距离阈值，池子越小越快；`prefer` 和 `stratify` 会先把池子切小。
 9. **调采样参数时不要重新扫描。** 把筛选结果 `collect()` 后存成 parquet，再用 `Query(df).sample(...)` 反复调参。但表里不带帧数据，最终输出 MotionDatabase 时仍要从 Source 再走一遍，或者用 `sql(..., keep=df)` JOIN 回去。
 10. **参数用 `$name` 绑定，不要用 f-string 拼 SQL。** 例如 `where("base_speed >= $v", v=speed)`，可以避免引号和精度问题。
+11. **大查询放在内存看门狗下跑。** 扫描进程池与采样进程池（`spread` / `stratify`）的每个 worker 约占 0.8 GB，默认 worker 数等于 CPU 核数；`MOTION_WORKERS` 可以控制采样进程池的大小。用 `uv run python scripts/mem_guard.py --limit 90 -- python ...` 运行，系统内存超过 90% 时会结束整个进程组。
 
 ## 现有查询脚本与示例
 

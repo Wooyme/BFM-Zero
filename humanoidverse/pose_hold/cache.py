@@ -1,4 +1,4 @@
-"""Static stability of a pose: the pose_hold score (pose_hold.py) of the BFM policy holding it from rest.
+"""Static stability of a pose: the pose_hold score (scores.py) of the BFM policy holding it from rest.
 
 The scores live in a SQLite cache (.cache/pose_hold.sqlite) that the query reads; poses it does not
 hold yet are evaluated in batches by a pose_hold Isaac Sim subprocess and added to it.
@@ -11,8 +11,8 @@ weights, duration, clearance, score config) are kept apart by their config id. E
 origin of the pose it was computed for ("<file>:<frame index>") and whether StabilityCache evaluated
 it (else it was imported from a ranking.csv).
 
-    uv run python -m humanoidverse.query.stability import [--ranking data/pose_hold/lafan_29dof/ranking.csv]
-    uv run python -m humanoidverse.query.stability stats
+    uv run python -m humanoidverse.pose_hold.cache import [--ranking data/pose_hold/lafan_29dof/ranking.csv]
+    uv run python -m humanoidverse.pose_hold.cache stats
 """
 
 import os
@@ -35,7 +35,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from humanoidverse.pose_hold import DEFAULT_MODEL, DEFAULT_OUTPUT, ROOT, ScoreConfig, sha256
+from humanoidverse.pose_hold.policy import DEFAULT_MODEL, DEFAULT_OUTPUT, ROOT, sha256
+from humanoidverse.pose_hold.scores import ScoreConfig
 
 CACHE = ROOT / ".cache" / "pose_hold.sqlite"
 QUANTUM = 1e-4  # rad, per quaternion component and joint angle
@@ -46,11 +47,13 @@ MODEL_FILES = (
     "checkpoint/model/init_kwargs.json",
     "checkpoint/model/model.safetensors",
 )
-# Columns of a cached score, as pose_hold_eval writes them to ranking.csv
+# Columns of a cached score, as pose_hold.eval writes them to ranking.csv
 SCORE_COLUMNS = (
     "score", "base_score", "joint_score", "pose_score", "distance_score", "cost", "valid",
     "base_error_mean_deg", "base_error_max_deg", "joint_rmse_mean", "joint_error_max",
     "end_displacement", "max_displacement", "tail_base_speed", "height_shift",
+    "fidelity_score", "stability_score", "height_score", "drift_score", "yaw_score", "tilt_score",
+    "height_dev_max", "drift_dev_max", "yaw_dev_max_deg", "tilt_dev_max_deg", "hold_height", "torso_tilt_deg",
 )  # fmt: skip
 
 SCHEMA = f"""
@@ -66,6 +69,8 @@ CREATE TABLE IF NOT EXISTS configs (config TEXT PRIMARY KEY, description TEXT);
 CREATE TABLE IF NOT EXISTS imports (path TEXT PRIMARY KEY, mtime_ns INTEGER, config TEXT, rows INTEGER);
 CREATE TABLE IF NOT EXISTS file_hashes (path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER, sha256 TEXT);
 """
+# columns named: a migrated table has them in another order
+INSERT = f"INTO scores (config, key, {', '.join(SCORE_COLUMNS)}, origin, evaluated) VALUES ({', '.join('?' * (len(SCORE_COLUMNS) + 4))})"
 
 
 def canonical(qpos: np.ndarray) -> np.ndarray:
@@ -110,11 +115,17 @@ def connect(path: Path = CACHE) -> sqlite3.Connection:
     con = sqlite3.connect(path, timeout=60)
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(SCHEMA)
-    if "evaluated" not in {row[1] for row in con.execute("PRAGMA table_info(scores)")}:
+    existing = {row[1] for row in con.execute("PRAGMA table_info(scores)")}
+    if "evaluated" not in existing:
         # caches from before the column marked evaluated scores by origin = 'evaluated'
         with con:
             con.execute("ALTER TABLE scores ADD COLUMN evaluated INTEGER")
             con.execute("UPDATE scores SET evaluated = (origin = 'evaluated')")
+    # score columns added later (stability split) are NULL in the rows of older evaluators
+    with con:
+        for c in SCORE_COLUMNS:
+            if c not in existing:
+                con.execute(f"ALTER TABLE scores ADD COLUMN {c} REAL")
     return con
 
 
@@ -202,7 +213,7 @@ class StabilityCache:
             poses = Path(tmp) / "poses.npz"
             np.savez(poses, codes=codes, keys=keys, origins=origins)
             command = [
-                sys.executable, "-m", "humanoidverse.query.stability", "evaluate", str(poses),
+                sys.executable, "-m", "humanoidverse.pose_hold.cache", "evaluate", str(poses),
                 "--cache", str(self.path), "--config", self.config, "--model-folder", str(self.model_folder),
                 "--duration", str(self.duration), "--clearance", str(self.clearance),
                 "--num-envs", str(min(self.num_envs, len(codes))), "--device", self.device,
@@ -231,6 +242,9 @@ def import_ranking(ranking: Path, path: Path = CACHE, force: bool = False) -> in
         identity["model_files"].values(), identity["duration"], identity["clearance"], ScoreConfig(**identity["score_config"])
     )
     print(f"Importing {ranking} as config {config}")
+    missing = set(SCORE_COLUMNS) - set(pd.read_csv(ranking, nrows=0).columns)
+    if missing:
+        raise ValueError(f"{ranking} lacks score columns {sorted(missing)}; rerun humanoidverse.pose_hold.eval")
     df = pd.read_csv(ranking, usecols=["source_index", "motion_name", "frame_index", *SCORE_COLUMNS])
     db = MotionDatabase.load(folder / "motion_db.pkl")
     qpos = pd.DataFrame({"source_index": db.source_index, "i": np.arange(len(db))})
@@ -242,7 +256,7 @@ def import_ranking(ranking: Path, path: Path = CACHE, force: bool = False) -> in
     with connect(path) as con:
         con.execute("INSERT OR IGNORE INTO configs VALUES (?, ?)", (config, description))
         # an evaluated score of the dequantized pose takes precedence over an imported nearby one
-        con.executemany(f"INSERT OR IGNORE INTO scores VALUES ({', '.join('?' * (len(SCORE_COLUMNS) + 4))})", rows)
+        con.executemany("INSERT OR IGNORE " + INSERT, rows)
         con.execute("INSERT OR REPLACE INTO imports VALUES (?, ?, ?, ?)", (str(ranking), mtime, config, len(rows)))
     print(f"  {len(rows)} rows, {df['key'].nunique()} distinct poses")
     return len(rows)
@@ -252,8 +266,8 @@ def run_evaluation(args):
     """Subprocess entry: pose_hold the poses of args.poses in batches, writing each batch to the cache."""
     import torch
 
-    from humanoidverse.pose_hold import GoalPolicy, Observations, load_training_config
-    from humanoidverse.pose_hold_eval import evaluate_batch, make_backend
+    from humanoidverse.pose_hold.eval import evaluate_batch, make_backend
+    from humanoidverse.pose_hold.policy import GoalPolicy, Observations, load_training_config
 
     torch.set_num_threads(1)
     torch.manual_seed(0)
@@ -278,7 +292,7 @@ def run_evaluation(args):
                     for i, (k, o) in enumerate(zip(keys[ix], origins[ix]))
                 ]
                 with connect(args.cache) as con:
-                    con.executemany(f"INSERT OR REPLACE INTO scores VALUES ({', '.join('?' * (len(SCORE_COLUMNS) + 4))})", rows)
+                    con.executemany("INSERT OR REPLACE " + INSERT, rows)
                 done = min(offset + args.num_envs, len(qpos))
                 print(f"  stability {done}/{len(qpos)} poses, {done / (time.perf_counter() - start):.1f} poses/s", flush=True)
     finally:
@@ -288,9 +302,9 @@ def run_evaluation(args):
 def stats(path: Path):
     with connect(path) as con:
         for config, description in con.execute("SELECT config, description FROM configs"):
-            n, mean = con.execute("SELECT count(*), avg(score) FROM scores WHERE config = ?", (config,)).fetchone()
+            n, mean, stability = con.execute("SELECT count(*), avg(score), avg(stability_score) FROM scores WHERE config = ?", (config,)).fetchone()
             counts = dict(con.execute("SELECT evaluated, count(*) FROM scores WHERE config = ? GROUP BY 1", (config,)).fetchall())
-            print(f"{config}: {n} poses ({counts.get(1, 0)} evaluated, {counts.get(0, 0)} imported), mean score {mean}")
+            print(f"{config}: {n} poses ({counts.get(1, 0)} evaluated, {counts.get(0, 0)} imported), mean score {mean}, mean stability_score {stability}")
             print(f"  {description}")
         for path, _, config, rows in con.execute("SELECT * FROM imports"):
             print(f"imported {path} -> {config} ({rows} rows)")

@@ -20,7 +20,7 @@ import tyro
 
 from humanoidverse.envs.g1_env_helper.bench.motion_metrics import MotionDatabase
 from humanoidverse.motion_latent import infer_z_by
-from humanoidverse.query.motion_query import Query, Source
+from humanoidverse.query.motion_query import Query, Source, zero_velocity
 from humanoidverse.query.motion_sampling import Cell, SymmetryError, grid
 
 # Weighted qpos distance, see bench/motion_similarity.py.
@@ -91,25 +91,6 @@ def vocab(query: Query, total: int = 4000, plot: Path | None = None):
     )
 
 
-def zero_velocity(db: MotionDatabase, bucket: str = "10_posture"):
-    """Zero the velocities in the next_obs of the frames of bucket, in place, as goal_inference does
-    (get_backward_observation with velocity_multiplier 0): a static posture is a goal without motion.
-
-    state is [dof_pos, dof_vel, projected_gravity, base_ang_vel] (dof_vel and base_ang_vel zeroed);
-    privileged_state is [root_height?, local_body_pos (3 * (nb - 1)), local_body_rot (6 * nb),
-    local_body_vel (3 * nb), local_body_ang_vel (3 * nb)] (the last 6 * nb zeroed).
-    """
-    rows = np.flatnonzero(db.metrics["bucket"] == db.labels["bucket"].index(bucket))
-    obs = db.frames["next_obs"]
-    ndof = db.frames["qvel"].shape[-1] - 6
-    obs["state"][rows, ndof: 2 * ndof] = 0
-    obs["state"][rows, 2 * ndof + 3:] = 0
-    width = obs["privileged_state"].shape[-1]
-    nb = (width + 3) // 15  # 15 * nb - 3, plus 1 with root_height
-    assert width in (15 * nb - 3, 15 * nb - 2), f"unexpected privileged_state width {width}"
-    obs["privileged_state"][rows, width - 6 * nb:] = 0
-
-
 def main(source: Source, total: int = 4096, latent: bool = False, output: Path | None = None):
     """Select the vocabulary from the replay buffer (or LAFAN motions with --lafan).
 
@@ -122,7 +103,8 @@ def main(source: Source, total: int = 4096, latent: bool = False, output: Path |
     """
     output = output or source.model_folder / "motion_vocab"
     db = vocab(source.scan(), total, plot=output).to_database()
-    zero_velocity(db)
+    # static postures are goals without motion
+    zero_velocity(db, np.flatnonzero(db.metrics["bucket"] == db.labels["bucket"].index("10_posture")))
     db.save(output / "motion_db.pkl")
     print(f"Saved MotionDatabase of {len(db)} frames at {output / 'motion_db.pkl'}")
     if latent:
