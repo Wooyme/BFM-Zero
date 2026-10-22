@@ -6,10 +6,11 @@ hold yet are evaluated in batches by a pose_hold Isaac Sim subprocess and added 
 A pose is keyed by what the evaluation sees of it: pose_hold resets the root to the origin, sets the
 height by ground clearance, and the policy and floor ignore heading, so the key is the yaw-free root
 quaternion and the joint angles, quantized to QUANTUM. The evaluated pose is the dequantized key, so
-a cached score belongs to exactly the poses that share its key. Scores of different evaluators (model
-weights, duration, clearance, score config) are kept apart by their config id. Each score keeps the
-origin of the pose it was computed for ("<file>:<frame index>") and whether StabilityCache evaluated
-it (else it was imported from a ranking.csv).
+a cached score belongs to exactly the poses that share its key. A pose held with a given latent
+(a row of a LatentDatabase) instead of its goal-inferred one is keyed by the pose and the latent.
+Scores of different evaluators (model weights, duration, clearance, score config) are kept apart by
+their config id. Each score keeps the origin of the pose it was computed for ("<file>:<frame index>")
+and whether StabilityCache evaluated it (else it was imported from a ranking.csv).
 
     uv run python -m humanoidverse.pose_hold.cache import [--ranking data/pose_hold/lafan_29dof/ranking.csv]
     uv run python -m humanoidverse.pose_hold.cache stats
@@ -85,10 +86,13 @@ def canonical(qpos: np.ndarray) -> np.ndarray:
     return np.round(np.concatenate((quat, q[:, 7:]), axis=1) / QUANTUM).astype(np.int32)
 
 
-def pose_keys(codes: np.ndarray) -> np.ndarray:
-    """(N,) int64 key of each row of canonical codes."""
+def pose_keys(codes: np.ndarray, z: np.ndarray | None = None) -> np.ndarray:
+    """(N,) int64 key of each row of canonical codes, held with the latents z (N, z_dim) if given."""
     codes = np.ascontiguousarray(codes)
-    return np.array([int.from_bytes(hashlib.blake2b(row.tobytes(), digest_size=8).digest(), "little", signed=True) for row in codes], dtype=np.int64)
+    rows = [row.tobytes() for row in codes]
+    if z is not None:
+        rows = [r + b"z" + zr.tobytes() for r, zr in zip(rows, np.ascontiguousarray(z, dtype=np.float32))]
+    return np.array([int.from_bytes(hashlib.blake2b(r, digest_size=8).digest(), "little", signed=True) for r in rows], dtype=np.int64)
 
 
 def pose_of(codes: np.ndarray) -> np.ndarray:
@@ -187,31 +191,33 @@ class StabilityCache:
             con.close()
         return found.set_index("key")
 
-    def scores(self, qpos: np.ndarray, origins: np.ndarray, columns=SCORE_COLUMNS) -> pd.DataFrame:
+    def scores(self, qpos: np.ndarray, origins: np.ndarray, columns=SCORE_COLUMNS, z: np.ndarray | None = None) -> pd.DataFrame:
         """(N,) rows of columns for poses qpos, evaluating the ones missing from the cache first.
 
         origins: (N,) "<file>:<frame index>" of each pose, kept with the scores it evaluates.
+        z: (N, z_dim) latents to hold the poses with instead of their goal-inferred ones.
         """
         codes = canonical(qpos)
-        keys = pose_keys(codes)
+        keys = pose_keys(codes, z)
         found = self.lookup(keys, columns)
         missing = ~np.isin(keys, found.index.to_numpy())
         _, first = np.unique(keys[missing], return_index=True)
         todo = np.flatnonzero(missing)[first]
         print(f"Stability: {len(qpos)} poses, {len(np.unique(keys))} distinct, {len(todo)} not cached")
         if len(todo):
-            self.evaluate(codes[todo], keys[todo], np.asarray(origins).astype(str)[todo])
+            self.evaluate(codes[todo], keys[todo], np.asarray(origins).astype(str)[todo], None if z is None else z[todo])
             found = self.lookup(keys, columns)
         if not np.isin(keys, found.index.to_numpy()).all():
             raise RuntimeError("Evaluation left poses without a cached score")
         return found.loc[keys].reset_index(drop=True)
 
-    def evaluate(self, codes: np.ndarray, keys: np.ndarray, origins: np.ndarray):
-        """Score the poses of codes with pose_hold in an Isaac Sim subprocess (a query may already run
-        an Isaac app, and there is one per process), which writes each finished batch to the cache."""
+    def evaluate(self, codes: np.ndarray, keys: np.ndarray, origins: np.ndarray, z: np.ndarray | None = None):
+        """Score the poses of codes (held with the latents z if given) with pose_hold in an Isaac Sim
+        subprocess (a query may already run an Isaac app, and there is one per process), which writes
+        each finished batch to the cache."""
         with tempfile.TemporaryDirectory() as tmp:
             poses = Path(tmp) / "poses.npz"
-            np.savez(poses, codes=codes, keys=keys, origins=origins)
+            np.savez(poses, codes=codes, keys=keys, origins=origins, **({} if z is None else {"z": z}))
             command = [
                 sys.executable, "-m", "humanoidverse.pose_hold.cache", "evaluate", str(poses),
                 "--cache", str(self.path), "--config", self.config, "--model-folder", str(self.model_folder),
@@ -273,6 +279,7 @@ def run_evaluation(args):
     torch.manual_seed(0)
     with np.load(args.poses) as data:
         codes, keys, origins = data["codes"], data["keys"], data["origins"]
+        z = data["z"] if "z" in data else None
     qpos = pose_of(codes)
     score_config = ScoreConfig(**{f.name: getattr(args, f.name) for f in dataclasses.fields(ScoreConfig)})
     config = load_training_config(args.model_folder)
@@ -286,7 +293,7 @@ def run_evaluation(args):
         with torch.inference_mode():
             for offset in range(0, len(qpos), args.num_envs):
                 ix = slice(offset, offset + args.num_envs)
-                result = evaluate_batch(backend, policy, observations, qpos[ix], args.duration, score_config)
+                result = evaluate_batch(backend, policy, observations, qpos[ix], args.duration, score_config, None if z is None else z[ix])
                 rows = [
                     (args.config, int(k), *(float(result[c][i]) for c in SCORE_COLUMNS), str(o), 1)
                     for i, (k, o) in enumerate(zip(keys[ix], origins[ix]))

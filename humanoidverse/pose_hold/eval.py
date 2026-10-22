@@ -103,7 +103,9 @@ def make_backend(config, batch_size, clearance, device):
     return IsaacBackend(config, batch_size=batch_size, clearance=clearance, device=device)
 
 
-def evaluate_batch(backend, policy, observations, qpos, duration, score_config):
+def evaluate_batch(backend, policy, observations, qpos, duration, score_config, z=None):
+    """Hold each pose of qpos from rest for duration with the goal-inferred latent of the pose, or the
+    latents z (n, z_dim) when given."""
     state = backend.reset(qpos)
     obs, tensors = observations.build(state, np.zeros((len(qpos), 29)), reset=True)
     initial = tensors["qpos"].clone()
@@ -120,7 +122,7 @@ def evaluate_batch(backend, policy, observations, qpos, duration, score_config):
     for key, space in policy.obs_space.spaces.items():
         if key not in obs or obs[key].shape[1:] != space.shape:
             raise RuntimeError(f"Checkpoint observation contract mismatch: {key}")
-    z = policy.goal_inference(obs)
+    z = policy.goal_inference(obs) if z is None else torch.as_tensor(z, dtype=torch.float32, device=initial.device)
     steps = math.ceil(duration / backend.dt)
     scoring = Scores(initial, steps, backend.dt, score_config, torso=observations.body_names.index("torso_link"))
     for step in range(steps):

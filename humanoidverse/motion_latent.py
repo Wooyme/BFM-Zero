@@ -15,9 +15,14 @@ from humanoidverse.envs.g1_env_helper.bench.motion_metrics import MotionDatabase
 def infer_z(model, frames: dict, per_frame: bool, device="cuda") -> np.ndarray:
     """z of MotionDatabase frames: one (1, z_dim) for all of them, or (N, z_dim) with per_frame.
 
-    Uses the kept backward embeddings B when present, otherwise next_obs (reward inference with
-    reward 1 on every frame, or goal inference per frame).
+    Uses the kept latents z of a LatentDatabase source when present (per frame only: they are not
+    backward embeddings to add up), else the kept backward embeddings B, otherwise next_obs (reward
+    inference with reward 1 on every frame, or goal inference per frame).
     """
+    if "z" in frames:
+        if not per_frame:
+            raise ValueError("Frames of generated latents keep z, which only has a per-frame meaning")
+        return np.asarray(frames["z"], dtype=np.float32)
     with torch.no_grad():
         if "B" in frames:
             B = torch.as_tensor(frames["B"], dtype=torch.float32, device=device)

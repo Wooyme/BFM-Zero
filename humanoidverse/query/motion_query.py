@@ -1,4 +1,5 @@
-"""Select frames of a replay buffer (or of LAFAN motions) with a chain of SQL-like operations
+"""Select frames of a replay buffer (or of LAFAN motions, or the rollout states of generated latents)
+with a chain of SQL-like operations
 over their per-frame metrics (METRICS in envs/g1_env_helper/queries/metrics.py).
 
     db = (
@@ -244,10 +245,12 @@ class ColumnOp:
 
 @dataclasses.dataclass(frozen=True)
 class StabilityOp:
-    """Add columns of the pose_hold scores of the rows' qpos ({name: cache column}), from the stability cache."""
+    """Add columns of the pose_hold scores of the rows' qpos ({name: cache column}), from the stability cache;
+    with latents, each pose held with the kept z of its frame instead of its goal-inferred one."""
 
     columns: tuple  # (name, cache column) pairs
     cache: object  # StabilityCache, opened on first use
+    latents: object = None  # LatentFrames of the frames
     row_local: bool = False
 
     def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -259,7 +262,8 @@ class StabilityOp:
         if "origin" not in df.columns:
             raise ValueError("Stability needs the origin column of the frame table")
         cache = self.cache() if self.cache is StabilityCache else self.cache
-        scores = cache.scores(qpos_of(df), df["origin"].to_numpy().astype(str), tuple(column for _, column in self.columns))
+        z = None if self.latents is None else self.latents.db.z[df["frame"].to_numpy()]
+        scores = cache.scores(qpos_of(df), df["origin"].to_numpy().astype(str), tuple(column for _, column in self.columns), z=z)
         return df.assign(**{name: scores[column].to_numpy().astype(np.float32) for name, column in self.columns})
 
 
@@ -268,10 +272,10 @@ class Query:
     """A lazy chain of operations over the frame table of a source; each method returns a new Query.
 
     Run it with collect (the table) or to_database (a MotionDatabase with the frame data). frames
-    is a frame source (H5Frames / LafanFrames), or a table already collected to query further.
+    is a frame source (H5Frames / LafanFrames / LatentFrames), or a table already collected to query further.
     """
 
-    frames: object  # H5Frames | LafanFrames | pd.DataFrame
+    frames: object  # H5Frames | LafanFrames | LatentFrames | pd.DataFrame
     ops: tuple = ()
     chunk: int = 100_000
     max_frames: int | None = None
@@ -328,15 +332,18 @@ class Query:
         fidelity (fidelity_score, how closely it reproduces the pose) and stability (stability_score, how
         little the base moves, falls or turns), read from the stability cache, the poses not cached yet
         evaluated in Isaac Sim batches and added to it. Not row-local, so it runs on the rows that reach it.
+        Over a LatentDatabase (LatentFrames), the policy holds each pose with the row's kept z.
 
         columns: {name: cache column} (columns of pose_hold.cache.SCORE_COLUMNS, e.g. score, base_score,
             joint_score, distance_score, height_score), default {"fidelity": "fidelity_score", "stability": "stability_score"}.
         cache: a StabilityCache (another model, evaluation settings or batch size), default its defaults.
         """
         from humanoidverse.pose_hold.cache import StabilityCache
+        from humanoidverse.query.latent_db import LatentFrames
 
         columns = columns or {"fidelity": "fidelity_score", "stability": "stability_score"}
-        return self._then(StabilityOp(tuple(columns.items()), cache or StabilityCache))
+        latents = self.frames if isinstance(self.frames, LatentFrames) else None
+        return self._then(StabilityOp(tuple(columns.items()), cache or StabilityCache, latents))
 
     def stable(self, min_score: float, min_fidelity: float | None = None, cache=None) -> "Query":
         """Keep the rows whose base stability (column stability, see with_stability) is >= min_score and,
@@ -466,6 +473,8 @@ class Source:
             comma-separated globs instead of the buffer, e.g. "walk*,run*". The motions are sampled
             at the env dt by the motion library of an Isaac env, which also gives their backward
             observations for latent inference.
+        latents: take the frames from a LatentDatabase pickle (query/latent_db.py) instead: the rollout
+            states of generated latents, with origin "<file stem>:<row>" and z kept in to_database.
         chunk: frames read from the source per step.
         max_frames: only scan the first max_frames frames.
         stride: only scan every stride-th frame.
@@ -476,6 +485,7 @@ class Source:
     buffer: Path | None = None
     lafan: str | None = None
     lafan_dir: Path = HUMANOIDVERSE_DIR / "data" / "lafan_29dof"
+    latents: Path | None = None
     chunk: int = 100_000
     max_frames: int | None = None
     stride: int = 1
@@ -484,6 +494,13 @@ class Source:
 
     def open(self):
         model_folder = Path(self.model_folder)
+        if self.lafan is not None and self.latents is not None:
+            raise ValueError("Pass one of lafan and latents")
+        if self.latents is not None:
+            from humanoidverse.query.latent_db import LatentFrames
+
+            print(f"Latents {self.latents}")
+            return LatentFrames(Path(self.latents))
         if self.lafan is not None:
             files = lafan_files(self.lafan_dir, self.lafan)
             print(f"Loading {len(files)} LAFAN motions: {[f.stem for f in files]}")

@@ -235,12 +235,14 @@ def main(db: Path, where: str | None = None, center: bool = True, mjcf: Path = M
     """Interactive MotionDatabase viewer.
 
     Args:
-        db: MotionDatabase pickle written by motion_query.
+        db: MotionDatabase pickle written by motion_query, or a LatentDatabase pickle (query/latent_db.py).
         where: initial SQL condition, same as the where command.
         center: move the root to the origin in xy, so frames from different clips stay in view.
         mjcf: robot model the qpos refers to (the one motion_query computed metrics with).
     """
-    motion_db = MotionDatabase.load(db)
+    from humanoidverse.query.latent_db import load_database
+
+    motion_db = load_database(db)
     print(f"Loaded {len(motion_db)} frames from {db}")
     viewer = MotionViewer(motion_db, mujoco.MjModel.from_xml_path(str(mjcf)), center=center)
     if where is not None:
