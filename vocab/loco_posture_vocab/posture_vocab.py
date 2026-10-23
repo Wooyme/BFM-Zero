@@ -16,7 +16,7 @@ from scipy.spatial import ConvexHull
 from humanoidverse.envs.g1_env_helper.bench.motion_metrics import qpos_of, sql
 from humanoidverse.envs.g1_env_helper.bench.motion_similarity import env_model
 from humanoidverse.query.motion_query import Query, to_database
-from humanoidverse.query.motion_sampling import Cell, allocate, grid, sample
+from humanoidverse.query.motion_sampling import Cell, SymmetryError, allocate, grid, sample
 
 # Identical to scripts/queries/multi_vocab.py.
 SIMILARITY = {
@@ -176,9 +176,10 @@ def annotate(table: pd.DataFrame, cfg: Postures, slack: float = 0.0) -> pd.DataF
 
 
 def locomotion(table: pd.DataFrame) -> pd.DataFrame:
-    """multi_vocab's 01_loco command, with its explicit UPRIGHT requirement."""
+    """Upright 01_loco frames from walk* and run* motions only."""
     return sql(
-        """SELECT * FROM frames WHERE base_height BETWEEN 0.55 AND 1.0 AND torso_tilt <= 30
+        """SELECT * FROM frames WHERE (origin GLOB 'walk*' OR origin GLOB 'run*')
+        AND base_height BETWEEN 0.55 AND 1.0 AND torso_tilt <= 30
         AND greatest(left_wrist_above_shoulder, right_wrist_above_shoulder) <= 0
         AND abs(base_vx) <= 1.05 AND abs(base_vy) <= 1.05 AND abs(yaw_rate) < 1.5
         AND NOT (abs(base_vx) < 0.05 AND abs(base_vy) < 0.05 AND abs(yaw_rate) < 0.05)""",
@@ -395,7 +396,7 @@ def select_frames(loco: pd.DataFrame, post: pd.DataFrame, total: int, cfg: Postu
     if total < 12 or total % 2:
         raise ValueError("total must be even and at least 12 to cover six postures")
     half = total // 2
-    loco, post = with_wrist_preference(loco), with_wrist_preference(post)
+    post = with_wrist_preference(post)
     if len(loco) < half:
         raise ValueError(f"Locomotion has {len(loco)} candidates for {half} tokens")
     required = {kind for kinds in KINDS.values() for kind in kinds}
@@ -405,14 +406,15 @@ def select_frames(loco: pd.DataFrame, post: pd.DataFrame, total: int, cfg: Postu
     minimum = {b: len(KINDS[b]) for b in BUCKETS}
     band_quota = quotas(BUCKETS, [int((post.bucket == b).sum()) for b in BUCKETS], half, minimum)
     parts = []
-    loco = loco.assign(bucket="01_loco", pose_kind="loco", grp="loco")
+    loco = loco.assign(bucket="01_loco", pose_kind="loco", grp="loco",
+                       symmetry_error=SymmetryError(weights=SIMILARITY)(loco))
     chain = (
         sample()
         .stratify(
             grid(base_vx=0.15, base_vy=0.15, range=(-1.05, 1.05)) | grid(yaw_rate=0.15, range=(-1.5, 1.5)),
             plot=None if plot is None else plot / "01_loco",
         )
-        .prefer("wrist_pelvis_distance", keep=0.5)
+        .prefer("symmetry_error", keep=0.5)
         .spread(SIMILARITY)
     )
     parts.append(loco.iloc[chain(loco, half)])

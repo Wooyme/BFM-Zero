@@ -191,9 +191,12 @@ class GeometryTests(unittest.TestCase):
             Postures(height_edges=(0, 0.25, 0.25, 0.65, 1)).validate()
 
     def test_locomotion_excludes_stand_and_tilted_frames(self):
-        rows = pd.DataFrame([frame(h=0.75), frame(h=0.75, tilt=60), frame(h=0.75)])
+        rows = pd.DataFrame([frame(h=0.75, i=i) for i in range(6)])
+        rows["origin"] = ["walk1_subject1:0", "walk2_subject1:0", "run1_subject1:0",
+                          "run2_subject1:0", "dance1_subject1:0", "sidewalk1_subject1:0"]
+        rows.loc[1, "torso_tilt"] = 60
         rows.loc[2, "base_vx"] = 0
-        self.assertEqual(len(locomotion(rows)), 1)
+        self.assertEqual(locomotion(rows).frame.tolist(), [0, 3])
 
     def test_ground_translation_preserves_orientation_and_relative_geometry(self):
         row = postures().iloc[[2]].copy()
