@@ -203,6 +203,8 @@ METRICS: Dict[str, Metric] = {
     "torso_height": BodyHeight("torso_link"),
     "left_hand_height": BodyHeight("left_rubber_hand"),
     "right_hand_height": BodyHeight("right_rubber_hand"),
+    "left_wrist_height": BodyHeight("left_wrist_roll_link"),
+    "right_wrist_height": BodyHeight("right_wrist_roll_link"),
     "left_knee_height": BodyHeight("left_knee_link"),
     "right_knee_height": BodyHeight("right_knee_link"),
     "left_foot_height": BodyHeight("left_ankle_roll_link"),

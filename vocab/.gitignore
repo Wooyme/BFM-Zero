@@ -1,0 +1,5 @@
+# Generated query data was ignored under the model directory before migration.
+/loco_posture_vocab/*
+!/loco_posture_vocab/README.md
+!/loco_posture_vocab/workspace.json
+!/loco_posture_vocab/*.py

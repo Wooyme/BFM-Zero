@@ -1,0 +1,15 @@
+{
+  "name": "loco_posture_vocab",
+  "project_root": "../..",
+  "model_folder": "../../new_model_for_training_code_inference",
+  "latest_run": "full_lafan_wrist_floor",
+  "scan_cache": "lafan_scan_cache",
+  "latest_query_inspection": "query_support_wrist_floor",
+  "query_script": "loco_posture_vocab.py",
+  "inspection_script": "inspect_posture_queries.py",
+  "rollout_script": "../../scripts/queries/rollout_vocab.py",
+  "posture_rules": "posture_vocab.py",
+  "posture_cem": "posture_cem.py",
+  "scan_cache_script": "scan_cache.py",
+  "query_module": "vocab.loco_posture_vocab.loco_posture_vocab"
+}

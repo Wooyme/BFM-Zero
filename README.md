@@ -541,6 +541,108 @@ uv run python scripts/queries/walk_vocab.py --model-folder /path/to/model --late
 
 Velocities follow the walking command: `base_vx` / `base_vy` are in m/s in the heading frame, and `yaw_rate` is in rad/s.
 
+### Locomotion and posture vocabulary
+
+`vocab/loco_posture_vocab/loco_posture_vocab.py` builds a fixed 4096-token vocabulary: 2048 upright locomotion
+commands and 2048 static posture goals. It retains `multi_vocab.py`'s velocity grid and similarity weights.
+Sampling prefers a small `min(abs(left_wrist_height - base_height), abs(right_wrist_height - base_height))`
+before similarity spreading, without a symmetry preference. Static standing belongs to the posture half.
+
+```bash
+uv run python -m vocab.loco_posture_vocab.loco_posture_vocab \
+    --model-folder /path/to/model --lafan '*' --latent \
+    --output vocab/loco_posture_vocab/runs/run_001
+```
+
+Query workspaces live under `vocab/<query-name>/`. The current query's cache, inspection sheets,
+historical runs and exports are in [`vocab/loco_posture_vocab/`](vocab/loco_posture_vocab/README.md).
+The business-specific query, sampling, visualization and CEM modules live in that workspace;
+the old `scripts/queries/` entry points remain compatibility wrappers.
+Its `latest/` link points to the latest validated run. The old model-directory workspace path remains
+a compatibility symlink; the model and source motions have not moved.
+
+For repeated full LAFAN runs, add `--scan-cache /path/to/cache`. The cache stores source frames,
+query metrics and collision heights, and invalidates when inputs, relevant geometry or query code
+change. Scanning runs in a subprocess so its Isaac instance exits before posture evaluation.
+
+The four nonoverlapping pelvis-height bands are `[0, 0.25)`, `[0.25, 0.45)`, `[0.45, 0.65)` and
+`[0.65, 1.0]` metres, for supine/prone, kneeling/half-kneeling, crouching/rising and standing.
+Each query also constrains **wrist, foot and knee heights** and torso tilt. It permits asymmetric support,
+one raised hand/foot and intermediate rising poses. The exact SQL clauses and their relaxed tolerances
+are in `vocab/loco_posture_vocab/posture_vocab.py::pose_conditions`.
+Both wrists must be no lower than the pelvis band's lower edge; the band's upper edge does not limit wrists.
+This condition stays strict during query relaxation, CEM and double-kneeling compensation.
+Each band initially receives 512 tokens; short bands can transfer quota to other postures,
+while the overall 50/50 split stays fixed. All six
+posture kinds must have at least one token. `--total` must therefore be even and at least 12.
+
+Kneeling uses strict support geometry: both ankles are at most 10cm high and differ by at most 3cm.
+For double kneeling, all four knee/ankle heights span at most 5cm and both knees are at most 8cm high.
+For half kneeling, the knees differ by at least 8cm, the lower knee is 2–7cm above both ankles and at
+most 11cm high, and the higher knee is no higher than the pelvis. These support conditions remain
+strict under `--relax`; transitional deep squats are excluded. Genuine-pose CEM uses the same criteria.
+The thresholds are configurable fields of `Postures` in `vocab/loco_posture_vocab/posture_vocab.py`.
+
+Use `uv run python -m vocab.loco_posture_vocab.inspect_posture_queries --cache /path/to/lafan_scan_cache/table.pkl`
+to filter the cached full scan, render two-view knee/ankle inspection sheets and export
+`query_samples.pkl` / `query_candidates.pkl` for `motion_viewer`. Knee centres are marked red and
+ankle centres blue. The inspection includes diverse motion clips and rejected deep-squat examples.
+
+Selection first uses poses whose lowest MJCF collision point is within `--ground-tol 0.05` metres of
+the floor. If band quotas or coverage are insufficient, it relaxes body tolerances by `--relax 0.05`.
+If that is still insufficient, airborne poses may be shifted rigidly by `clearance - lowest_collision_z`;
+all world heights, root qpos and the backward observation's root height are adjusted consistently.
+Fallback rows are admitted only when they address an existing missing cell or short height band.
+This fallback uses forward kinematics and preserves joint angles. Disable it with `--no-align-airborne`.
+Penetrating poses are not rescued. Isaac evaluation subsequently uses the actual USD collision geometry.
+
+With `--latent`, postures use fresh per-frame `goal_inference` with zero qvel and observation velocities.
+The script evaluates 5-second holds, then runs CEM for low stability, height drift or posture mismatch,
+retaining the original goal as an incumbent. Stability above 95 is a soft target; CEM aims for 96 and
+uses a 3cm height tolerance. An optimized latent normally must retain its posture class.
+Unresolved goals also try a stable neighbouring cell as a new CEM search centre. Half-kneeling first
+searches from its own latents; on failure it may borrow a nearby-height double-kneeling latent.
+Crouching latents cannot fill half-kneeling cells. Within the kneeling height band, scarce genuine
+half-kneeling samples retain their quota and the remaining slots go to double kneeling.
+This explicit compensation mode checks target height, the mandatory wrist lower bound and Stability, and records the seed kind,
+actual held kind and `height_only` flag rather than requiring half-kneeling geometry.
+Compensated targets receive another static hold from the reached pose. Their exported qpos and
+observations are updated together, with all goal velocities zeroed.
+Numeric failures are replaced with unused candidates, or stop export if no valid replacement exists.
+
+Before final selection, CEM can also synthesize missing cells from nearby-cell goal latents. Cells are
+posture kind × 5cm height; targets fill height gaps within observed support and seed missing kinds,
+without requesting every Cartesian combination of permissive query bounds. Synthesized tokens are
+accepted by their **actual reached pose and median rollout height**, with a second hold from that pose. Inclination remains
+a broad pose-query condition and a diagnostic, without a target grid or CEM inclination objective. During synthesis, the 3cm
+height target refers to the destination cell centre rather than the parent pose. `--max-fill 64` and
+`--fill-attempts 2` bound synthesis; `--fill-seeds 8` tries diverse nearby parents for each missing cell
+and retains at most one accepted token per task. Increase these for sparse sources. `--no-fill-cells` disables synthesis,
+and `--no-cem` disables both optimization and synthesis. Selection without `--latent` does neither.
+
+Outputs default to `vocab/loco_posture_vocab/`; use `--output` to select a run subdirectory:
+
+- `motion_db.pkl`: source/target frames, zero-velocity posture observations and final latents/scores when requested.
+- `latent_z.pkl` with `--latent`: `{bucket: (N, z_dim)}`, locomotion first, followed by the four posture bands.
+- `selection.csv` and `plots/`: source frame, parent frame, candidate stage and sampling distributions.
+- `summary.json`: filter counts, quotas, six-kind coverage, synthesis attempts, unfilled cells and final quality.
+- `posture_rollouts.npz` with `--latent`: final rollouts and scores aligned to posture rows in `motion_db.pkl`.
+- `initial_motion_db.pkl` and, with `--latent`, `initial_z.npy`: selected goals before CEM, saved before evaluation.
+
+The source may be a replay buffer, `--lafan` motions or `--latents` rollout states. A stationary-only
+source generally cannot provide the required locomotion half; use a source containing both groups.
+
+To save the last state of each latent after five seconds from the model's configured default pose:
+
+```bash
+uv run python scripts/queries/rollout_vocab.py --model-folder /path/to/model --latents /path/to/latent_z.pkl
+uv run python -m humanoidverse.motion_viewer --db /path/to/default_rollout_last.pkl
+```
+
+The rollout preserves the configured initial height, starts with zero velocity, and keeps actual final
+velocities. The output sits beside `latent_z.pkl`; `source_index` is the token index, and `bucket` and
+`token_in_bucket` preserve vocabulary grouping. Use `--duration` to change the rollout length.
+
 ### Latent residual VQ
 
 `humanoidverse.latent_vq` tokenizes the goal latent of every LAFAN frame into two tokens, after the action tokenizer of VQ-BeT: an MLP encoder, a 2-layer residual VQ (the first code is coarse, the second quantizes what it left) and an MLP decoder whose output is projected onto the z sphere like `project_z`. Codebooks are EMA updated with k-means initialization and dead-code replacement; the loss is L1 reconstruction + 5 × commitment.

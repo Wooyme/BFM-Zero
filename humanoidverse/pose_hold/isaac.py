@@ -212,7 +212,7 @@ class IsaacBackend:
         self.robot.set_joint_position_target(q[:, 7:], joint_ids=self.joint_ids, env_ids=ids)
         self.robot.set_joint_velocity_target(torch.zeros((len(ids), 29), device=self.device), joint_ids=self.joint_ids, env_ids=ids)
 
-    def reset(self, qpos):
+    def reset(self, qpos, *, align_ground=True):
         self.n = len(qpos)
         # Pad the final batch with copies; those environments never enter scores.
         q = torch.as_tensor(qpos, dtype=torch.float32, device=self.device).clone()
@@ -222,16 +222,19 @@ class IsaacBackend:
         self.valid[:] = True
         self._write(q)
         self._forward()
-        transforms = self.robot.root_physx_view.get_link_transforms().clone()
-        minimum = self.geometry.minimum(transforms) - self.origins[:, 2]
-        self.shift = self.clearance - minimum
-        q[:, 2] += self.shift
+        self.shift = torch.zeros(self.batch_size, device=self.device)
+        if align_ground:
+            transforms = self.robot.root_physx_view.get_link_transforms().clone()
+            minimum = self.geometry.minimum(transforms) - self.origins[:, 2]
+            self.shift = self.clearance - minimum
+            q[:, 2] += self.shift
         self.initial = q.clone()
         self._write(q)
         self._forward()
-        minimum = self.geometry.minimum(self.robot.root_physx_view.get_link_transforms()) - self.origins[:, 2]
-        if not torch.allclose(minimum, torch.full_like(minimum, self.clearance), atol=2e-4, rtol=0):
-            raise RuntimeError(f"USD clearance alignment failed: {minimum.min().item()} .. {minimum.max().item()}")
+        if align_ground:
+            minimum = self.geometry.minimum(self.robot.root_physx_view.get_link_transforms()) - self.origins[:, 2]
+            if not torch.allclose(minimum, torch.full_like(minimum, self.clearance), atol=2e-4, rtol=0):
+                raise RuntimeError(f"USD clearance alignment failed: {minimum.min().item()} .. {minimum.max().item()}")
         state = self.read()
         if state["qvel"].abs().max().item() > 1e-5:
             raise RuntimeError("Reset left nonzero velocity")
